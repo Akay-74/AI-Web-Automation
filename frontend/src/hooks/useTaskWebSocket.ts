@@ -6,9 +6,11 @@ import { getWebSocketUrl, TaskStep, UiEvent } from "@/lib/api";
 /**
  * Hook for subscribing to real-time task execution updates via WebSocket.
  *
- * Fixed: previously had `status` in useCallback deps which caused
- * infinite reconnect loops (connect recreated → effect cleanup → reconnect).
- * Now uses a ref for status to avoid stale closures without re-triggering effects.
+ * Upgraded to support:
+ * - Bidirectional communication (send user actions back to backend)
+ * - Screencast frame handling (JPEG stream)
+ * - CAPTCHA detection events
+ * - Viewport dimension tracking
  */
 export function useTaskWebSocket(taskId: string) {
     const [steps, setSteps] = useState<TaskStep[]>([]);
@@ -16,6 +18,12 @@ export function useTaskWebSocket(taskId: string) {
     const [status, setStatus] = useState<string>("");
     const [connected, setConnected] = useState(false);
     const [screenshot, setScreenshot] = useState<string | null>(null);
+    const [captchaDetected, setCaptchaDetected] = useState(false);
+    const [captchaType, setCaptchaType] = useState<string>("");
+    const [viewport, setViewport] = useState<{ width: number; height: number }>({
+        width: 1920,
+        height: 1080,
+    });
     const wsRef = useRef<WebSocket | null>(null);
     const statusRef = useRef(status);
 
@@ -23,6 +31,16 @@ export function useTaskWebSocket(taskId: string) {
     useEffect(() => {
         statusRef.current = status;
     }, [status]);
+
+    /**
+     * Send a user action to the backend via WebSocket.
+     * Used for interactive browser control and CAPTCHA resume.
+     */
+    const sendAction = (action: Record<string, unknown>) => {
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify(action));
+        }
+    };
 
     useEffect(() => {
         if (!taskId) return;
@@ -50,11 +68,27 @@ export function useTaskWebSocket(taskId: string) {
                         statusRef.current = data.status;
                     }
 
-                    // Handle base64 Screenshot
-                    if (data.action === "screenshot" || data.raw_event?.action === "screenshot") {
+                    // Handle base64 Screenshot (legacy PNG) or Screencast Frame (live JPEG)
+                    if (data.action === "screenshot" || data.action === "screencast_frame"
+                        || data.raw_event?.action === "screenshot" || data.raw_event?.action === "screencast_frame") {
                         const img = data.details?.image || data.raw_event?.details?.image;
                         if (img) setScreenshot(img);
                         return;
+                    }
+
+                    // Handle CAPTCHA events
+                    if (data.action === "captcha_detected") {
+                        setCaptchaDetected(true);
+                        setCaptchaType(data.raw_event?.captcha_type || data.details?.captcha_type || "unknown");
+                    }
+                    if (data.action === "captcha_solved") {
+                        setCaptchaDetected(false);
+                        setCaptchaType("");
+                    }
+
+                    // Track viewport dimensions from browser_launched
+                    if (data.action === "browser_launched" && data.raw_event?.viewport) {
+                        setViewport(data.raw_event.viewport);
                     }
 
                     // Append UI Chat Events
@@ -132,5 +166,15 @@ export function useTaskWebSocket(taskId: string) {
         };
     }, [taskId]); // Only re-run when taskId changes, NOT status
 
-    return { steps, uiEvents, status, connected, screenshot };
+    return {
+        steps,
+        uiEvents,
+        status,
+        connected,
+        screenshot,
+        captchaDetected,
+        captchaType,
+        viewport,
+        sendAction,
+    };
 }

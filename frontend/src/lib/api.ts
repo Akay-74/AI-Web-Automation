@@ -98,6 +98,17 @@ export const api = {
         // Backend returns { results: [...] }
         return data.results ?? data;
     },
+
+    async cancelTask(taskId: string): Promise<Task> {
+        const res = await fetch(`${API_BASE_URL}/tasks/${taskId}/cancel`, { method: "POST" });
+        if (!res.ok) throw new Error(await res.text());
+        return res.json();
+    },
+
+    async deleteTask(taskId: string): Promise<void> {
+        const res = await fetch(`${API_BASE_URL}/tasks/${taskId}`, { method: "DELETE" });
+        if (!res.ok) throw new Error(await res.text());
+    },
 };
 
 export function getWebSocketUrl(taskId: string): string {

@@ -155,7 +155,10 @@ async def _stream_via_polling(websocket: WebSocket, task_id: str):
 
 @router.websocket("/ws/tasks/{task_id}")
 async def task_websocket(websocket: WebSocket, task_id: UUID):
-    """Stream live task execution updates to the client.
+    """Bidirectional WebSocket for live task updates AND user input.
+
+    Outbound (server → client): task execution events, screencast frames.
+    Inbound  (client → server): user clicks, keypresses, CAPTCHA resume.
 
     Uses Redis PubSub when Redis is available; falls back to DB polling
     for local development without Redis.
@@ -163,7 +166,47 @@ async def task_websocket(websocket: WebSocket, task_id: UUID):
     task_id_str = str(task_id)
     await manager.connect(task_id_str, websocket)
 
+    async def _handle_user_input():
+        """Listen for incoming user input messages and forward to browser."""
+        from app.services.agent.registry import get_browser
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                data = json.loads(raw)
+                action = data.get("user_action")
+                if not action:
+                    continue
+
+                browser = get_browser(task_id_str)
+                if not browser:
+                    continue
+
+                if action == "click":
+                    await browser.handle_user_click(
+                        float(data.get("x", 0)),
+                        float(data.get("y", 0)),
+                    )
+                elif action == "type":
+                    await browser.handle_user_type(data.get("text", ""))
+                elif action == "keypress":
+                    await browser.handle_user_keypress(data.get("key", "Enter"))
+                elif action == "scroll":
+                    await browser.handle_user_scroll(
+                        float(data.get("deltaX", 0)),
+                        float(data.get("deltaY", 0)),
+                    )
+                elif action == "captcha_resume":
+                    browser.resume_after_captcha()
+                    logger.info("CAPTCHA resume received from user", task_id=task_id_str)
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.debug("User input handler ended", error=str(e)[:200])
+
     try:
+        # Start user input listener as a background task
+        input_task = asyncio.create_task(_handle_user_input())
+
         if await _redis_available():
             logger.info("WS using Redis PubSub", task_id=task_id_str)
             await _stream_via_redis(websocket, task_id_str)
@@ -175,4 +218,6 @@ async def task_websocket(websocket: WebSocket, task_id: UUID):
     except Exception as e:
         logger.error("WebSocket error", task_id=task_id_str, error=str(e)[:200])
     finally:
+        input_task.cancel()
         manager.disconnect(task_id_str, websocket)
+

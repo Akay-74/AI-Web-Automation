@@ -18,14 +18,14 @@ export function AgentChatPanel({ events }: AgentChatPanelProps) {
     }, [events]);
 
     return (
-        <div className="flex flex-col h-full bg-[#0d0d14] rounded-xl border border-slate-800 overflow-hidden shadow-xl">
-            <div className="p-4 border-b border-slate-800 flex items-center gap-3 bg-black/40">
-                <div className="w-8 h-8 rounded-full bg-brand-600/20 flex items-center justify-center">
+        <div className="flex flex-col h-full bg-[#131313] rounded-xl border border-slate-800 overflow-hidden shadow-xl">
+            <div className="p-4 border-b border-slate-800 flex items-center gap-3 bg-black/60">
+                <div className="w-8 h-8 rounded-full bg-zinc-600/20 flex items-center justify-center">
                     <span className="text-xl">🤖</span>
                 </div>
                 <div>
                     <h2 className="font-semibold text-slate-100 leading-tight">Project Antigravity Agent</h2>
-                    <p className="text-xs text-brand-400 opacity-80">Autonomous Browser AI</p>
+                    <p className="text-xs text-zinc-400 opacity-80">Autonomous Browser AI</p>
                 </div>
             </div>
 
@@ -48,10 +48,10 @@ export function AgentChatPanel({ events }: AgentChatPanelProps) {
                                 </div>
                                 <div
                                     className={`p-3 rounded-2xl rounded-tl-sm text-sm shadow-sm transition-all animate-in fade-in slide-in-from-bottom-2 ${isError
-                                            ? "bg-red-500/10 text-red-100 border border-red-500/20"
-                                            : isSuccess
-                                                ? "bg-green-500/10 text-green-100 border border-green-500/20"
-                                                : "bg-[#1e1e2d] text-slate-200 border border-slate-700/50"
+                                        ? "bg-red-500/10 text-red-100 border border-red-500/20"
+                                        : isSuccess
+                                            ? "bg-green-500/10 text-green-100 border border-green-500/20"
+                                            : "bg-[#262626] text-slate-200 border border-slate-700/50"
                                         }`}
                                 >
                                     <span className="opacity-50 text-xs mr-2 font-mono hidden md:inline-block">

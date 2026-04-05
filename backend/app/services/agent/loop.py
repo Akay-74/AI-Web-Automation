@@ -1,7 +1,8 @@
 """Agent Loop — Central orchestrator for browser automation tasks.
 
-Executes plan steps, captures screenshots, validates results, evaluates
-completion, and broadcasts both raw events and human-friendly UI events.
+Executes plan steps, streams a live CDP screencast, validates results,
+evaluates completion, and broadcasts both raw events and human-friendly
+UI events.
 """
 
 import base64
@@ -17,10 +18,11 @@ from app.config import get_settings
 from app.services.agent.planner import AIPlanner
 from app.services.agent.evaluator import ResultEvaluator
 from app.services.agent.validator import ResultValidator
-from app.services.browser.controller import BrowserController
+from app.services.browser.controller import BrowserController, _detect_captcha, _solve_captcha
 from app.services.browser.analyzer import PageAnalyzer
 from app.services.browser.extractor import DataExtractor
 from app.services.memory.vector import VectorMemory
+from app.services.agent.registry import register_browser, unregister_browser
 
 logger = structlog.get_logger()
 
@@ -106,8 +108,23 @@ class AgentLoop:
         if self.on_step:
             await self.on_step(message)
 
+    async def _send_screencast_frame(self, frame_b64: str):
+        """Forward a CDP screencast frame (base64 JPEG) to the frontend."""
+        try:
+            msg = {
+                "task_id": self.task_id,
+                "step": 0,
+                "action": "screencast_frame",
+                "details": {"image": frame_b64, "format": "jpeg"},
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            if self.on_step:
+                await self.on_step(msg)
+        except Exception as e:
+            logger.debug("Screencast frame forward failed", error=str(e)[:200])
+
     async def _broadcast_screenshot(self, step_num: int):
-        """Capture screenshot and publish it via the on_step callback."""
+        """Fallback: capture a single PNG screenshot if screencast is off."""
         try:
             png_bytes = await self.browser.screenshot()
             b64 = base64.b64encode(png_bytes).decode("ascii")
@@ -138,9 +155,13 @@ class AgentLoop:
                 "plan": plan_descriptions,
             })
 
-            # Phase 2: Launch browser
+            # Phase 2: Launch browser, start screencast, register for input
             await self.browser.launch()
-            await self._broadcast(0, "browser_launched", {})
+            register_browser(self.task_id, self.browser)
+            await self.browser.start_screencast(self._send_screencast_frame)
+            await self._broadcast(0, "browser_launched", {
+                "viewport": self.browser.viewport_size,
+            })
 
             # Phase 3: Execute steps
             replan_count = 0
@@ -165,8 +186,32 @@ class AgentLoop:
 
                 result = await self.browser.execute(step)
 
-                # Screenshot after every browser action
-                if action not in ("evaluate", "wait"):
+                # Check for CAPTCHA after each action
+                captcha_type = await _detect_captcha(self.browser.page)
+                if captcha_type:
+                    # Broadcast CAPTCHA alert to frontend
+                    await self._broadcast(i + 1, "captcha_detected", {
+                        "captcha_type": captcha_type,
+                        "message": f"{captcha_type.upper()} detected — please solve it in the browser viewer",
+                    })
+                    # Try API solver first if key is configured
+                    api_key = getattr(self.settings, "captcha_api_key", "")
+                    if api_key:
+                        solved = await _solve_captcha(self.browser.page, captcha_type, self.settings)
+                        if solved:
+                            await self._broadcast(i + 1, "captcha_solved", {"method": "api"})
+                        else:
+                            # Fall back to human
+                            await self.browser.pause_for_human_captcha()
+                            await self._broadcast(i + 1, "captcha_solved", {"method": "human"})
+                    else:
+                        # No API key — wait for human
+                        await self.browser.pause_for_human_captcha()
+                        await self._broadcast(i + 1, "captcha_solved", {"method": "human"})
+
+                # Screencast handles continuous frames; only take a
+                # fallback screenshot if screencast is not running.
+                if not self.browser._screencast_running and action not in ("evaluate", "wait"):
                     await self._broadcast_screenshot(i + 1)
 
                 if not result.get("success", False):
@@ -291,6 +336,7 @@ class AgentLoop:
                 "steps_executed": 0,
             }
         finally:
+            unregister_browser(self.task_id)
             await self.browser.close()
 
     def _generate_summary(self) -> str:

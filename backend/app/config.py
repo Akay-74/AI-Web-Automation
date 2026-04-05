@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     max_retries: int = 3
     default_replan_attempts: int = 2
 
+    # CAPTCHA Solver (optional — leave blank to skip)
+    captcha_api_key: str = ""
+
+    # CDP Screencast
+    screencast_fps: int = 60
+    screencast_quality: int = 40
+
     # Worker
     worker_concurrency: int = 2
 

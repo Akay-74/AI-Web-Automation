@@ -26,9 +26,11 @@ Type a goal like **"Find the cheapest RTX 4060 laptop on Amazon"** and the agent
 1. 🧠 **Plans** a step-by-step browser action sequence using GPT-4o-mini
 2. 🌐 **Controls** a headless Chromium browser using Playwright
 3. 🖱️ **Navigates**, types, clicks, scrolls, and extracts data from live websites
-4. ✅ **Validates** results against your constraints (GPU model, price cap, brand)
-5. 🔄 **Replans** automatically if constraints aren't satisfied
-6. 📡 **Streams** live status updates to your browser via WebSocket
+4. 🛡️ **Bypasses Detectors** with Playwright stealth, bezier-curve mouse movements, and random typing delays
+5. ✅ **Validates** results against your constraints (GPU model, price cap, brand)
+6. 🔄 **Replans** automatically if constraints aren't satisfied
+7. 📡 **Streams** a live CDP screencast to your browser via WebSocket
+8. 🖱️ **Interactive Mode** lets you click/scroll inside the screencast, and pauses for **Human CAPTCHA** solving natively in the UI
 
 ---
 
@@ -159,10 +161,11 @@ No configuration needed — the system adapts automatically.
 | **Browser Controller** | `browser/controller.py` | Playwright wrapper: navigate, click, type, scroll, screenshot, extract |
 | **Page Analyzer** | `browser/analyzer.py` | Converts raw HTML → compressed inner text for reliable LLM parsing |
 | **Data Extractor** | `browser/extractor.py` | CSS heuristic extraction → LLM fallback; outputs structured JSON |
+| **Agent Registry** | `agent/registry.py` | Maps active tasks to browser controllers for routing interactive WebSocket input |
 | **Result Validator** | `agent/validator.py` | Enforces GPU model, price cap, brand constraints with regex |
 | **Result Evaluator** | `agent/evaluator.py` | Deterministic completion check → LLM verification if inconclusive |
 | **Vector Memory** | `memory/vector.py` | FAISS + `text-embedding-3-small`; optional, gracefully disabled |
-| **WebSocket Hub** | `api/routes/websocket.py` | Redis PubSub or DB polling fallback for live updates |
+| **WebSocket Hub** | `api/routes/websocket.py` | Bidirectional: streams status/screencast and receives user clicks/keystrokes |
 
 ---
 
@@ -218,6 +221,7 @@ cat > .env << EOF
 OPENAI_API_KEY=sk-or-v1-your-openrouter-key-here
 OPENAI_BASE_URL=https://openrouter.ai/api/v1
 DATABASE_URL=sqlite:///./agent.db
+# Optional: CAPTCHA_API_KEY=your-2captcha-key
 EOF
 
 uvicorn app.main:app --reload --port 8000

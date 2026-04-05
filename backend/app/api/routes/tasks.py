@@ -76,8 +76,9 @@ async def _run_agent_background(task_id: str, goal: str):
         try:
             async def on_step(message: dict):
                 is_screenshot = message.get("action") == "screenshot"
+                is_screencast = message.get("action") == "screencast_frame"
 
-                if not is_screenshot:
+                if not is_screenshot and not is_screencast:
                     log_entry = TaskLog(
                         task_id=task_uuid,
                         step_number=message.get("step", 0),
@@ -89,7 +90,7 @@ async def _run_agent_background(task_id: str, goal: str):
                 
                 if redis_client:
                     await redis_client.publish(f"task_updates:{task_id}", json.dumps(message))
-                elif is_screenshot:
+                elif is_screenshot or is_screencast:
                     from app.api.routes.websocket import manager
                     asyncio.create_task(manager.broadcast(task_id, message))
 
@@ -248,3 +249,27 @@ async def get_task_logs(task_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     )
     logs = result.scalars().all()
     return logs
+
+
+@router.delete("/tasks/{task_id}", status_code=204)
+async def delete_task(task_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """Delete a task and all associated logs and results."""
+    result = await db.execute(select(Task).where(Task.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Delete associated logs
+    logs = await db.execute(select(TaskLog).where(TaskLog.task_id == task_id))
+    for log in logs.scalars().all():
+        await db.delete(log)
+
+    # Delete associated results
+    results = await db.execute(select(Result).where(Result.task_id == task_id))
+    for r in results.scalars().all():
+        await db.delete(r)
+
+    await db.delete(task)
+    await db.commit()
+    logger.info("Task deleted", task_id=str(task_id))
+

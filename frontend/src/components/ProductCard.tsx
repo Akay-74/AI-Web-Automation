@@ -5,126 +5,134 @@ import { ProductResult } from "@/lib/api";
 interface ProductCardProps {
     product: ProductResult;
     isCheapest?: boolean;
+    rank?: number;
+    allPrices?: number[];
 }
 
-export function ProductCard({ product, isCheapest }: ProductCardProps) {
+export function ProductCard({ product, isCheapest, rank, allPrices = [] }: ProductCardProps) {
     const formatPrice = (price: number | null | undefined, currency: string = "USD") => {
-        if (price === null || price === undefined) return "Unknown Price";
-        return new Intl.NumberFormat("en-US", {
-            style: "currency",
-            currency: currency,
-        }).format(price);
+        if (price === null || price === undefined) return "—";
+        return new Intl.NumberFormat("en-US", { style: "currency", currency }).format(price);
     };
 
+    const isValid = product.is_valid !== false;
+    const hasPrice = typeof product.price === "number";
+
+    let priceScore: number | null = null;
+    if (hasPrice && allPrices.length > 1) {
+        const sorted = [...allPrices].sort((a, b) => a - b);
+        const idx = sorted.indexOf(product.price!);
+        priceScore = Math.round(100 - (idx / (sorted.length - 1)) * 100);
+    }
+
     return (
-        <div className={`relative flex flex-col p-5 bg-[#12121a] rounded-xl border transition-all hover:-translate-y-1 hover:shadow-lg ${isCheapest
-            ? "border-brand-500 shadow-[0_0_15px_rgba(99,102,241,0.2)]"
-            : "border-slate-800 hover:border-slate-600"
-            }`}>
+        <div className={`relative flex flex-col rounded-2xl overflow-hidden transition-all duration-300 group ${isCheapest
+                ? "bg-[#1a1919] glow-chrome"
+                : isValid
+                    ? "bg-[#131313] hover:bg-[#1a1919]"
+                    : "bg-[#131313] opacity-60"
+            }`} style={{ border: isCheapest ? "1px solid rgba(198,198,198,0.15)" : "1px solid rgba(72,72,72,0.1)" }}>
+
+            {/* Chrome top bar for best match */}
             {isCheapest && (
-                <div className="absolute -top-3 -right-3 bg-brand-500 text-white text-[10px] uppercase tracking-wider font-bold px-3 py-1 rounded-full shadow-md animate-bounce">
-                    Cheapest Valid
-                </div>
+                <div className="h-[2px] bg-gradient-to-r from-transparent via-[#c6c6c6] to-transparent" />
             )}
 
-            {/* Header / Title */}
-            <div className="mb-4 text-slate-100">
-                <h3 className="font-semibold line-clamp-2 text-lg" title={product.name || product.title}>
-                    {product.name || product.title || "Extracted Item"}
-                </h3>
-                {(product.company || product.source) && (
-                    <div className="text-brand-400 text-sm font-medium mt-1">
-                        {product.company || product.source}
+            <div className="p-5 flex flex-col gap-3 flex-1">
+                {/* Rank + validity */}
+                <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                        {rank !== undefined && <span className="text-[10px] font-mono text-[#888787]">#{rank}</span>}
+                        {isCheapest && (
+                            <span className="text-[10px] font-bold uppercase tracking-widest text-[#e7e5e4] bg-gradient-to-r from-[rgba(198,198,198,0.12)] to-[rgba(198,198,198,0.04)] px-2.5 py-0.5 rounded-full flex items-center gap-1">
+                                <span className="material-symbols-rounded text-xs">stars</span>
+                                Top Match
+                            </span>
+                        )}
                     </div>
-                )}
-            </div>
+                    <span className={`badge ${isValid ? "badge-success" : "badge-danger"}`}>
+                        {isValid ? "Verified" : "Invalid"}
+                    </span>
+                </div>
 
-            {/* Price & Rating (Only if it's a product) */}
-            {(product.price !== undefined || product.rating) && (
-                <div className="flex items-end justify-between mb-4 pb-4 border-b border-slate-800/50">
-                    <div>
-                        {product.price !== undefined && product.price !== null ? (
-                            <span className="text-2xl font-bold text-white tracking-tight">
+                {/* Title */}
+                <div>
+                    <h3 className="text-sm font-bold text-[#e7e5e4] line-clamp-2 leading-snug group-hover:text-[#f9f9f9] transition-colors"
+                        title={product.name || product.title}>
+                        {product.name || product.title || "Extracted Item"}
+                    </h3>
+                    {(product.company || product.source) && (
+                        <p className="text-[11px] text-[#a8a7a6] mt-0.5 truncate font-medium">{product.company || product.source}</p>
+                    )}
+                </div>
+
+                {/* Price + rating */}
+                {(hasPrice || product.rating) && (
+                    <div className="flex items-end justify-between">
+                        {hasPrice ? (
+                            <span className={`text-2xl font-extrabold tracking-tight ${isCheapest ? "gradient-text-chrome" : "text-[#f9f9f9]"}`}>
                                 {formatPrice(product.price, product.currency)}
                             </span>
                         ) : (
-                            <span className="text-slate-500 font-medium">Price not listed</span>
+                            <span className="text-[#888787] text-sm">—</span>
                         )}
-                    </div>
-                    {product.rating && (
-                        <div className="flex items-center gap-1 text-sm font-medium text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded">
-                            ★ {product.rating}
-                        </div>
-                    )}
-                </div>
-            )}
-
-            {/* Content / Specs Grid */}
-            <div className="flex-1 text-xs mb-4">
-                {product.summary || product.content ? (
-                    <p className="text-slate-400 leading-relaxed line-clamp-5 text-sm">
-                        {product.summary || product.content}
-                    </p>
-                ) : (
-                    <div className="grid grid-cols-2 gap-y-3 gap-x-2">
-                        {product.gpu && (
-                            <div className="col-span-2 flex items-start gap-2">
-                                <span className="text-slate-500 w-12 shrink-0">GPU</span>
-                                <span className="text-slate-300 font-medium">{product.gpu}</span>
-                            </div>
-                        )}
-                        {product.cpu && (
-                            <div className="col-span-2 flex items-start gap-2">
-                                <span className="text-slate-500 w-12 shrink-0">CPU</span>
-                                <span className="text-slate-300">{product.cpu}</span>
-                            </div>
-                        )}
-                        {product.ram && (
-                            <div className="flex items-start gap-2">
-                                <span className="text-slate-500 w-10 shrink-0">RAM</span>
-                                <span className="text-slate-300">{product.ram}</span>
-                            </div>
-                        )}
-                        {product.storage && (
-                            <div className="flex items-start gap-2">
-                                <span className="text-slate-500 w-10 shrink-0">Disk</span>
-                                <span className="text-slate-300">{product.storage}</span>
-                            </div>
-                        )}
-                        {product.location && (
-                            <div className="col-span-2 flex items-start gap-2 mt-2">
-                                <span className="text-slate-500 w-12 shrink-0">Loc</span>
-                                <span className="text-slate-300">{product.location}</span>
-                            </div>
+                        {product.rating && (
+                            <span className="badge badge-warning">★ {product.rating}</span>
                         )}
                     </div>
                 )}
+
+                {/* Value score bar */}
+                {priceScore !== null && (
+                    <div>
+                        <div className="flex items-center justify-between mb-1">
+                            <span className="text-[9px] text-[#888787] uppercase tracking-widest font-semibold">Value Index</span>
+                            <span className={`text-[9px] font-bold ${priceScore >= 80 ? "text-[#4ade80]" : priceScore >= 50 ? "text-[#fbbf24]" : "text-[#ee7d77]"
+                                }`}>{priceScore}/100</span>
+                        </div>
+                        <div className="h-[2px] bg-[#1a1919] rounded-full overflow-hidden">
+                            <div className="h-full rounded-full transition-all duration-700"
+                                style={{
+                                    width: `${priceScore}%`,
+                                    background: priceScore >= 80 ? "linear-gradient(90deg,#4ade80,#22c55e)"
+                                        : priceScore >= 50 ? "linear-gradient(90deg,#fbbf24,#f59e0b)"
+                                            : "linear-gradient(90deg,#ee7d77,#ef4444)"
+                                }} />
+                        </div>
+                    </div>
+                )}
+
+                {/* Specs */}
+                {!product.summary && !product.content && (
+                    <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
+                        {[["GPU", product.gpu], ["CPU", product.cpu], ["RAM", product.ram], ["Disk", product.storage]].filter(([, v]) => v).map(([label, val]) => (
+                            <div key={label} className={`flex gap-1.5 ${label === "GPU" ? "col-span-2" : ""}`}>
+                                <span className="text-[#888787] w-7 shrink-0 font-semibold">{label}</span>
+                                <span className="text-[#d4d3d2] truncate">{val}</span>
+                            </div>
+                        ))}
+                    </div>
+                )}
+
+                {(product.summary || product.content) && (
+                    <p className="text-[11px] text-[#a8a7a6] leading-relaxed line-clamp-3">{product.summary || product.content}</p>
+                )}
             </div>
 
-            {/* Validation Reason (if rejected or warned) */}
-            {product.validation_reason && product.validation_reason !== "Leave empty" && (
-                <div className="mt-auto mb-4 bg-slate-900/50 rounded p-2 text-[10px] text-slate-400 leading-tight">
-                    {product.validation_reason.split("; ").map((reason, i) => (
-                        <div key={i} className={reason.startsWith("✗") ? "text-red-400" : reason.startsWith("⚠") ? "text-amber-400" : "text-green-400"}>
-                            {reason}
-                        </div>
-                    ))}
-                </div>
-            )}
-
             {/* Action */}
-            <div className="mt-auto pt-2">
-                {product.url && product.url !== "No link" && !product.url.toLowerCase().includes("no featured offers") ? (
-                    <a
-                        href={product.url.startsWith("http") ? product.url : `https://${product.url}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="block w-full text-center py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium transition-colors"
-                    >
-                        View {product.title ? "Link" : "Product"} ↗
+            <div className="px-5 pb-5">
+                {product.url && product.url !== "No link" && !product.url.toLowerCase().includes("no featured") ? (
+                    <a href={product.url.startsWith("http") ? product.url : `https://${product.url}`}
+                        target="_blank" rel="noreferrer"
+                        className={`flex items-center justify-center gap-1.5 w-full py-2.5 rounded-xl text-xs font-bold transition-all ${isCheapest
+                                ? "btn-chrome py-2.5"
+                                : "bg-[#1a1919] hover:bg-[#262626] text-[#d4d3d2] hover:text-[#e7e5e4] border border-[rgba(72,72,72,0.1)]"
+                            }`}>
+                        <span className="material-symbols-rounded text-sm">open_in_new</span>
+                        View Source
                     </a>
                 ) : (
-                    <button disabled className="w-full py-2.5 rounded-lg bg-slate-900 text-slate-600 text-sm font-medium cursor-not-allowed">
+                    <button disabled className="w-full py-2.5 rounded-xl bg-[#0e0e0e] text-[#262626] text-xs font-semibold cursor-not-allowed">
                         No Link Available
                     </button>
                 )}
