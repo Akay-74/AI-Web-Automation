@@ -1,24 +1,16 @@
-"""Pydantic schemas for Task API requests and responses."""
+"""Pydantic schemas for the Task API."""
 
-from datetime import datetime
 import uuid
+from datetime import datetime
 from typing import Optional
+
 from pydantic import BaseModel, Field
 
-
-# --- Request Schemas ---
 
 class TaskCreate(BaseModel):
     goal: str = Field(..., min_length=5, max_length=2000, description="Natural language goal")
     priority: int = Field(default=0, ge=0, le=10)
 
-
-class TaskUpdate(BaseModel):
-    status: Optional[str] = None
-    error_message: Optional[str] = None
-
-
-# --- Response Schemas ---
 
 class TaskResponse(BaseModel):
     id: uuid.UUID
@@ -37,9 +29,8 @@ class TaskLogResponse(BaseModel):
     id: uuid.UUID
     task_id: uuid.UUID
     step_number: int
-    action: str
-    details: dict
-    screenshot_url: Optional[str] = None
+    action: Optional[str] = None
+    details: dict = Field(default_factory=dict)
     created_at: datetime
 
     model_config = {"from_attributes": True}

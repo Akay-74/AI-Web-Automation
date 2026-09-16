@@ -1,221 +1,194 @@
-"""Browser Controller — Playwright wrapper with CDP screencast,
-anti-detection stealth, human-like input simulation, and CAPTCHA solving.
+"""Browser controller — Playwright wrapper with a CDP screencast, light
+anti-detection, multi-tab handling, and CAPTCHA support.
 
-Key upgrades over the original screenshot-based controller:
-  • CDP Screencast: streams compressed JPEG frames at ~5 FPS via
-    ``Page.startScreencast`` instead of taking expensive PNG screenshots.
-  • Stealth: applies ``playwright_stealth`` to mask automation flags so
-    websites see a regular Chrome browser.
-  • Human-like input: bezier-curve mouse movement and randomised keystroke
-    delays to defeat behavioural bot-detection.
-  • CAPTCHA solver: optional integration with 2Captcha / CapSolver APIs —
-    detects reCAPTCHA / hCaptcha iframes and auto-solves them.
+Actions arrive as ``{"action": ..., "params": {...}}`` and target elements by
+the ``element_id`` the perception layer assigned, which this class resolves to
+a selector just before executing.
 """
 
 import asyncio
-import math
 import random
-from typing import Optional, Callable, Awaitable, List, Tuple
+from typing import Awaitable, Callable, Optional
 
-from playwright.async_api import (
-    async_playwright, Page, Browser, BrowserContext, CDPSession,
-)
 import structlog
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    CDPSession,
+    Page,
+    async_playwright,
+)
 
 from app.config import get_settings
+from app.services.browser.state import BrowserState, InteractiveElement, TabInfo
+from app.services.perception.element_mapper import ElementMapper
+from app.services.perception.page_observer import extract_page_outline
 
 logger = structlog.get_logger()
 
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
-# ---------------------------------------------------------------------------
-# Helpers: human-like mouse & keyboard
-# ---------------------------------------------------------------------------
-
-def _bezier_curve(
-    start: Tuple[float, float],
-    end: Tuple[float, float],
-    steps: int = 20,
-) -> List[Tuple[float, float]]:
-    """Generate points along a cubic bezier curve between *start* and *end*.
-
-    Two random control points are placed to simulate the natural arc a
-    human hand takes when moving a mouse.
-    """
-    sx, sy = start
-    ex, ey = end
-    # Random control points offset from the straight line
-    cp1 = (
-        sx + (ex - sx) * random.uniform(0.2, 0.4) + random.uniform(-80, 80),
-        sy + (ey - sy) * random.uniform(0.0, 0.3) + random.uniform(-80, 80),
-    )
-    cp2 = (
-        sx + (ex - sx) * random.uniform(0.6, 0.8) + random.uniform(-80, 80),
-        sy + (ey - sy) * random.uniform(0.7, 1.0) + random.uniform(-80, 80),
-    )
-
-    points: List[Tuple[float, float]] = []
-    for i in range(steps + 1):
-        t = i / steps
-        u = 1 - t
-        x = (u**3 * sx + 3 * u**2 * t * cp1[0]
-             + 3 * u * t**2 * cp2[0] + t**3 * ex)
-        y = (u**3 * sy + 3 * u**2 * t * cp1[1]
-             + 3 * u * t**2 * cp2[1] + t**3 * ey)
-        points.append((x, y))
-    return points
-
-
-async def _human_move(page: Page, x: float, y: float) -> None:
-    """Move mouse to (*x*, *y*) along a bezier curve with jitter."""
-    try:
-        current = await page.evaluate("() => ({x: window._lastMouseX || 0, y: window._lastMouseY || 0})")
-        start = (current.get("x", 0), current.get("y", 0))
-    except Exception:
-        start = (0, 0)
-
-    for px, py in _bezier_curve(start, (x, y), steps=random.randint(15, 30)):
-        await page.mouse.move(px, py)
-        await asyncio.sleep(random.uniform(0.005, 0.02))
-
-    # Remember position for next move
-    await page.evaluate(f"() => {{ window._lastMouseX = {x}; window._lastMouseY = {y}; }}")
-
-
-async def _human_type(page: Page, selector: str, text: str, timeout: int) -> None:
-    """Type *text* into *selector* with randomised per-key delays."""
-    await page.click(selector, timeout=timeout)
-    await page.fill(selector, "", timeout=timeout)  # clear first
-    for ch in text:
-        await page.keyboard.type(ch, delay=random.randint(40, 160))
-        # occasional micro-pause
-        if random.random() < 0.08:
-            await asyncio.sleep(random.uniform(0.15, 0.4))
+# Masks the automation flags that the cheapest bot checks read.
+_STEALTH_INIT_SCRIPT = """
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    window.chrome = { runtime: {} };
+"""
 
 
 # ---------------------------------------------------------------------------
 # CAPTCHA detection & solving
 # ---------------------------------------------------------------------------
 
-async def _detect_captcha(page: Page) -> Optional[str]:
-    """Return the CAPTCHA type if a **visible challenge** is detected, else ``None``.
+_CAPTCHA_DOM_JS = """() => {
+    const visible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return false;
+        const style = getComputedStyle(el);
+        return style.display !== 'none' && style.visibility !== 'hidden';
+    };
 
-    Strictly avoids false positives (like the reCAPTCHA v3 invisible badge).
+    if (visible(document.querySelector('#challenge-running, #challenge-form'))) return 'turnstile';
+
+    const recaptcha = document.querySelector('.g-recaptcha');
+    if (visible(recaptcha) && recaptcha.getAttribute('data-size') !== 'invisible') return 'recaptcha';
+
+    if (visible(document.querySelector('.h-captcha'))) return 'hcaptcha';
+
+    return null;
+}"""
+
+
+async def detect_captcha(page: Optional[Page]) -> Optional[str]:
+    """Return the CAPTCHA type if a *visible* challenge is up, else None.
+
+    Deliberately ignores the invisible reCAPTCHA v3 badge, which is present on
+    a large share of the web and is not a challenge.
     """
+    if not page:
+        return None
+
     try:
-        # 1. Check iframes for actual challenge URLs
-        for iframe in page.frames:
-            url = iframe.url
-            # reCAPTCHA v2 active challenge popup
-            if "google.com/recaptcha" in url and "bframe" in url:
-                return "recaptcha"
-            # reCAPTCHA v2 "I'm not a robot" checkbox (must NOT be the invisible badge)
-            if "google.com/recaptcha" in url and "anchor" in url and "size=invisible" not in url:
-                return "recaptcha"
-            
-            # hCaptcha active challenge
+        for frame in page.frames:
+            url = frame.url
+            if "google.com/recaptcha" in url:
+                if "bframe" in url or ("anchor" in url and "size=invisible" not in url):
+                    return "recaptcha"
             if "hcaptcha.com" in url and "/challenge" in url:
                 return "hcaptcha"
-                
-            # Cloudflare Turnstile interactive challenge frame
             if "challenges.cloudflare.com" in url and "interactive" in url:
                 return "turnstile"
 
-        # 2. Check for Cloudflare full-page block in DOM
-        visible = await page.evaluate("""() => {
-            const isVis = (el) => el && el.offsetWidth > 0 && el.offsetHeight > 0 && getComputedStyle(el).display !== 'none';
-            if (isVis(document.querySelector('#challenge-running, #challenge-form'))) return 'turnstile';
-            return null;
-        }""")
-        if visible:
-            return visible
-
-    except Exception:
-        pass
-    return None
+        return await page.evaluate(_CAPTCHA_DOM_JS)
+    except Exception as e:
+        # A detection failure must not kill the step that triggered it.
+        logger.debug("CAPTCHA detection failed", error=str(e)[:200])
+        return None
 
 
-async def _solve_captcha(page: Page, captcha_type: str, settings) -> bool:
-    """Attempt to solve a CAPTCHA via a third-party solver API.
+# Token injection per provider. The token is passed as an argument rather than
+# interpolated into the source, so a hostile solver response cannot inject JS.
+_INJECT_TOKEN_JS = {
+    "recaptcha": """(token) => {
+        const field = document.getElementById('g-recaptcha-response');
+        if (field) field.innerHTML = token;
+        if (typeof ___grecaptcha_cfg !== 'undefined') {
+            Object.values(___grecaptcha_cfg.clients || {}).forEach((client) => {
+                const cb = client?.S?.S?.callback || client?.S?.callback;
+                if (typeof cb === 'function') cb(token);
+            });
+        }
+    }""",
+    "hcaptcha": """(token) => {
+        document.querySelectorAll('[name="h-captcha-response"]').forEach((el) => {
+            el.innerHTML = token;
+            el.value = token;
+        });
+    }""",
+    "turnstile": """(token) => {
+        document.querySelectorAll('[name="cf-turnstile-response"]').forEach((el) => {
+            el.value = token;
+        });
+        if (window._cf_chl_opt && typeof window._cf_chl_opt.callback === 'function') {
+            window._cf_chl_opt.callback(token);
+        }
+    }""",
+}
 
-    Requires ``CAPTCHA_API_KEY`` to be set in the environment.  If not set,
-    logs a warning and returns ``False``.
-    """
-    api_key = getattr(settings, "captcha_api_key", "")
-    if not api_key:
-        logger.warning("CAPTCHA detected but no CAPTCHA_API_KEY configured")
+_SOLVER_METHODS = {
+    "recaptcha": {"method": "userrecaptcha", "key_param": "googlekey"},
+    "hcaptcha": {"method": "hcaptcha", "key_param": "sitekey"},
+    "turnstile": {"method": "turnstile", "key_param": "sitekey"},
+}
+
+_SITEKEY_JS = """() => {
+    const el = document.querySelector('[data-sitekey], [data-hcaptcha-sitekey]');
+    if (!el) return null;
+    return el.getAttribute('data-sitekey') || el.getAttribute('data-hcaptcha-sitekey');
+}"""
+
+
+async def solve_captcha(page: Page, captcha_type: str, api_key: str) -> bool:
+    """Solve a CAPTCHA through the 2Captcha API. Returns True on success."""
+    solver = _SOLVER_METHODS.get(captcha_type)
+    if not solver:
+        logger.warning("No solver for CAPTCHA type", captcha_type=captcha_type)
         return False
 
     try:
         import httpx
 
-        # Extract the sitekey from the page
-        sitekey = await page.evaluate("""() => {
-            const el = document.querySelector('[data-sitekey]');
-            return el ? el.getAttribute('data-sitekey') : null;
-        }""")
-
+        sitekey = await page.evaluate(_SITEKEY_JS)
         if not sitekey:
-            logger.warning("CAPTCHA detected but sitekey not found in DOM")
+            logger.warning("CAPTCHA sitekey not found in DOM", captcha_type=captcha_type)
             return False
 
-        page_url = page.url
-
-        # Use 2Captcha API format
-        async with httpx.AsyncClient(timeout=120) as client:
-            # Submit CAPTCHA task
-            captcha_type_param = "userrecaptcha" if captcha_type == "recaptcha" else "hcaptcha"
-            submit_resp = await client.get(
+        async with httpx.AsyncClient(timeout=30) as client:
+            submit = await client.get(
                 "https://2captcha.com/in.php",
                 params={
                     "key": api_key,
-                    "method": captcha_type_param,
-                    "googlekey": sitekey,
-                    "pageurl": page_url,
+                    "method": solver["method"],
+                    solver["key_param"]: sitekey,
+                    "pageurl": page.url,
                     "json": 1,
                 },
             )
-            submit_data = submit_resp.json()
-
+            submit_data = submit.json()
             if submit_data.get("status") != 1:
                 logger.error("CAPTCHA submit rejected", response=submit_data)
                 return False
 
             captcha_id = submit_data["request"]
-            logger.info("CAPTCHA submitted to solver", captcha_id=captcha_id)
+            logger.info("CAPTCHA sent to solver", captcha_id=captcha_id, captcha_type=captcha_type)
 
-            # Poll for solution (max 120s)
-            for _ in range(24):
+            for _ in range(24):  # up to ~120s
                 await asyncio.sleep(5)
-                poll_resp = await client.get(
+                poll = await client.get(
                     "https://2captcha.com/res.php",
                     params={"key": api_key, "action": "get", "id": captcha_id, "json": 1},
                 )
-                poll_data = poll_resp.json()
+                poll_data = poll.json()
 
                 if poll_data.get("status") == 1:
-                    token = poll_data["request"]
-                    # Inject solution token into the page
-                    await page.evaluate(f"""() => {{
-                        document.getElementById('g-recaptcha-response').innerHTML = '{token}';
-                        if (typeof ___grecaptcha_cfg !== 'undefined') {{
-                            Object.entries(___grecaptcha_cfg.clients).forEach(([k,v]) => {{
-                                const cb = v?.S?.S?.callback || v?.S?.callback;
-                                if (cb) cb('{token}');
-                            }});
-                        }}
-                    }}""")
-                    logger.info("CAPTCHA solved and injected")
+                    await page.evaluate(_INJECT_TOKEN_JS[captcha_type], poll_data["request"])
+                    logger.info("CAPTCHA solved and injected", captcha_type=captcha_type)
                     return True
 
                 if "CAPCHA_NOT_READY" not in str(poll_data.get("request", "")):
                     logger.error("CAPTCHA solve failed", response=poll_data)
                     return False
 
-        logger.warning("CAPTCHA solve timed out")
+        logger.warning("CAPTCHA solve timed out", captcha_type=captcha_type)
         return False
 
     except Exception as e:
-        logger.error("CAPTCHA solver error", error=str(e)[:300])
+        logger.error("CAPTCHA solver error", error=str(e)[:300], captcha_type=captcha_type)
         return False
 
 
@@ -224,34 +197,51 @@ async def _solve_captcha(page: Page, captcha_type: str, settings) -> bool:
 # ---------------------------------------------------------------------------
 
 class BrowserController:
-    """Manages the Playwright browser lifecycle, actions, CDP screencast,
-    and anti-detection measures."""
+    """Owns the Playwright lifecycle, action execution, and the screencast."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        user_data_dir: Optional[str] = None,
+        headless: bool = True,
+    ):
+        self._settings = get_settings()
+        self._user_data_dir = user_data_dir
+        self._headless = headless
+        self._viewport = {
+            "width": self._settings.viewport_width,
+            "height": self._settings.viewport_height,
+        }
+
         self._playwright = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._cdp: Optional[CDPSession] = None
-        self._settings = get_settings()
 
-        # Screencast state
+        self.element_mapper = ElementMapper()
+
+        self._pages: list[Page] = []
+        self._active_tab: int = 0
+
         self._screencast_running = False
         self._on_frame: Optional[Callable[[str], Awaitable[None]]] = None
 
-        # Human-in-the-loop CAPTCHA: agent pauses here until human solves it
+        # Last known cursor position, for human-ish mouse paths.
+        self._cursor = (0.0, 0.0)
+
+        # Set while a human is solving a CAPTCHA; the agent waits on it.
         self._captcha_event = asyncio.Event()
-        self._captcha_event.set()  # starts unblocked
+        self._captcha_event.set()
         self._waiting_for_human = False
 
     @property
-    def page(self) -> Page:
+    def page(self) -> Optional[Page]:
         return self._page
 
     @property
     def viewport_size(self) -> dict:
-        """Return the browser viewport dimensions for coordinate scaling."""
-        return {"width": 1920, "height": 1080}
+        """Viewport dimensions the frontend scales click coordinates against."""
+        return dict(self._viewport)
 
     @property
     def waiting_for_human(self) -> bool:
@@ -262,108 +252,108 @@ class BrowserController:
     # ------------------------------------------------------------------
 
     async def launch(self) -> None:
-        """Launch a stealthy Chromium browser and optionally start screencast."""
+        """Launch Chromium (or a persistent profile) and open a CDP session."""
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-            ],
-        )
-        self._context = await self._browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-            timezone_id="America/New_York",
-        )
 
-        # Apply stealth patches (mask webdriver flags, plugin arrays, etc.)
-        try:
-            from playwright_stealth import stealth_async
-            await stealth_async(self._context)
-            logger.info("Stealth patches applied")
-        except ImportError:
-            logger.warning("playwright-stealth not installed — skipping stealth patches")
+        launch_args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+        ]
+        context_options = {
+            "viewport": dict(self._viewport),
+            "user_agent": _USER_AGENT,
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+        }
 
-        self._page = await self._context.new_page()
+        if self._user_data_dir:
+            logger.info("Launching persistent browser profile", user_data_dir=self._user_data_dir)
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=self._user_data_dir,
+                headless=self._headless,
+                args=launch_args,
+                **context_options,
+            )
+            self._page = (
+                self._context.pages[0]
+                if self._context.pages
+                else await self._context.new_page()
+            )
+        else:
+            self._browser = await self._playwright.chromium.launch(
+                headless=self._headless,
+                args=launch_args,
+            )
+            self._context = await self._browser.new_context(**context_options)
+            self._page = await self._context.new_page()
 
-        # Extra stealth: override navigator.webdriver at page level
-        await self._page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            window.chrome = { runtime: {} };
-        """)
+        await self._context.add_init_script(_STEALTH_INIT_SCRIPT)
 
-        # Open a CDP session for screencast
-        self._cdp = await self._page.context.new_cdp_session(self._page)
-        logger.info("Browser launched with stealth + CDP session")
+        self._pages = [self._page]
+        self._active_tab = 0
+        self._cdp = await self._context.new_cdp_session(self._page)
+        logger.info("Browser launched", headless=self._headless, viewport=self._viewport)
 
     async def close(self) -> None:
-        """Stop screencast, close browser, and release resources."""
+        """Stop the screencast and tear the browser down."""
         await self.stop_screencast()
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
+        try:
+            if self._context:
+                await self._context.close()
+            if self._browser:
+                await self._browser.close()
+        except Exception as e:
+            logger.debug("Browser close error", error=str(e)[:200])
+        finally:
+            if self._playwright:
+                await self._playwright.stop()
+            self._page = None
+            self._pages = []
         logger.info("Browser closed")
 
     # ------------------------------------------------------------------
-    # CDP Screencast
+    # CDP screencast
     # ------------------------------------------------------------------
 
-    async def start_screencast(
-        self,
-        on_frame: Callable[[str], Awaitable[None]],
-        fps: int = 60,
-        quality: int = 60,
-    ) -> None:
-        """Begin streaming JPEG frames from the browser via CDP.
+    async def start_screencast(self, on_frame: Callable[[str], Awaitable[None]]) -> None:
+        """Stream JPEG frames from the browser to *on_frame* as base64.
 
-        Args:
-            on_frame: async callback receiving a base64-encoded JPEG string.
-            fps: informational — everyNthFrame is always 1 for max smoothness.
-            quality: JPEG quality 1-100 (default 60 — crisp but efficient).
+        Frame size matches the viewport 1:1 so the frontend can map a click on
+        the image straight back to a browser coordinate.
         """
         if self._screencast_running or not self._cdp:
             return
 
+        fps = max(1, min(30, self._settings.screencast_fps))
         self._on_frame = on_frame
         self._screencast_running = True
-
-        # Listen for frames from the CDP session
         self._cdp.on("Page.screencastFrame", self._handle_screencast_frame)
 
         await self._cdp.send("Page.startScreencast", {
             "format": "jpeg",
-            "quality": quality,
-            "maxWidth": 1920,
-            "maxHeight": 1080,
-            "everyNthFrame": 1,  # every single rendered frame
+            "quality": self._settings.screencast_quality,
+            "maxWidth": self._viewport["width"],
+            "maxHeight": self._viewport["height"],
+            "everyNthFrame": max(1, round(60 / fps)),
         })
-        logger.info("CDP screencast started", quality=quality)
+        logger.info("Screencast started", fps=fps, quality=self._settings.screencast_quality)
 
     async def _handle_screencast_frame(self, params: dict) -> None:
-        """Process an incoming screencast frame from CDP."""
         try:
-            session_id = params.get("sessionId", 0)
-            # Acknowledge the frame so CDP keeps sending
             if self._cdp:
-                await self._cdp.send("Page.screencastFrameAck", {"sessionId": session_id})
-            # Forward base64 JPEG data to the callback
+                await self._cdp.send(
+                    "Page.screencastFrameAck",
+                    {"sessionId": params.get("sessionId", 0)},
+                )
             if self._on_frame and params.get("data"):
                 await self._on_frame(params["data"])
         except Exception as e:
             logger.debug("Screencast frame error", error=str(e)[:200])
 
     async def stop_screencast(self) -> None:
-        """Stop the CDP screencast stream."""
+        """Stop the CDP screencast."""
         if not self._screencast_running or not self._cdp:
             return
         try:
@@ -372,197 +362,327 @@ class BrowserController:
             pass
         self._screencast_running = False
         self._on_frame = None
-        logger.info("CDP screencast stopped")
+        logger.info("Screencast stopped")
+
+    async def _switch_cdp_to(self, page: Page) -> None:
+        """Point the screencast at a different tab."""
+        on_frame = self._on_frame  # stop_screencast clears it
+        await self.stop_screencast()
+        self._cdp = await self._context.new_cdp_session(page)
+        if on_frame:
+            await self.start_screencast(on_frame)
 
     # ------------------------------------------------------------------
-    # Retry helper
+    # Perception
     # ------------------------------------------------------------------
 
-    async def _retry(
-        self,
-        coro_factory,
-        retries: int = 2,
-        base_delay: float = 1.0,
-        label: str = "operation",
-    ):
-        """Retry a coroutine with exponential backoff."""
-        last_error = None
-        for attempt in range(1 + retries):
-            try:
-                return await coro_factory()
-            except Exception as e:
-                last_error = e
-                if attempt < retries:
-                    delay = base_delay * (2 ** attempt)
-                    logger.warning(
-                        f"Retrying {label}",
-                        attempt=attempt + 1, delay=delay, error=str(e)[:200],
-                    )
-                    await asyncio.sleep(delay)
-        raise last_error
+    async def get_browser_state(self) -> BrowserState:
+        """Re-read the page: elements, outline, tabs."""
+        if not self._page:
+            return BrowserState()
+
+        elements = await self.element_mapper.map_elements(self._page)
+        outline = await extract_page_outline(self._page)
+
+        open_tabs = []
+        for idx, p in enumerate(self._pages):
+            open_tabs.append(TabInfo(
+                tab_id=idx,
+                title=await _safe_title(p),
+                url=p.url,
+                active=(idx == self._active_tab),
+            ))
+
+        return BrowserState(
+            active_tab=self._active_tab,
+            open_tabs=open_tabs,
+            current_url=self._page.url,
+            page_title=await _safe_title(self._page),
+            page_structure=outline,
+            interactive_elements=elements,
+        )
+
+    def resolve_element(self, params: dict) -> Optional[InteractiveElement]:
+        """Resolve the ``element_id`` in *params* against the current page."""
+        element_id = params.get("element_id")
+        if element_id is None:
+            return None
+        try:
+            return self.element_mapper.get(int(element_id))
+        except (ValueError, TypeError):
+            return None
 
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
 
-    async def execute(self, step: dict) -> dict:
-        """Execute a single browser action from a plan step.
+    async def execute(self, action: str, params: dict) -> dict:
+        """Execute one action. Returns ``{"success": bool, ...}``."""
+        if not self._page and action != "navigate":
+            return {"success": False, "error": "Browser has no open page"}
 
-        CAPTCHA detection/handling is done by the AgentLoop after each
-        action — not here — so it can broadcast events to the frontend.
-        """
-        action = step.get("action", "unknown")
-        params = step.get("params", {})
+        handlers = {
+            "navigate": lambda: self._navigate(params.get("url", "")),
+            "click": lambda: self._click(params),
+            "type": lambda: self._type(params),
+            "hover": lambda: self._hover(params),
+            "select": lambda: self._select(params),
+            "keypress": lambda: self._keypress(params.get("key", "Enter")),
+            "back": self._back,
+            "scroll": lambda: self._scroll(
+                params.get("direction", "down"),
+                int(params.get("amount", 600)),
+            ),
+            "extract": self._extract,
+            "wait": lambda: self._wait(params.get("seconds", 2)),
+            "new_tab": self._new_tab,
+            "switch_tab": lambda: self._switch_tab(int(params.get("tab_id", 0))),
+            "close_tab": lambda: self._close_tab(int(params.get("tab_id", 0))),
+            "get_tabs": self._get_tabs,
+        }
+
+        handler = handlers.get(action)
+        if not handler:
+            return {"success": False, "error": f"Unknown action: {action}"}
 
         try:
-            if action == "navigate":
-                return await self._navigate(params.get("url", "https://www.google.com"))
-            elif action == "click":
-                return await self._click(params.get("selector", ""))
-            elif action == "type":
-                return await self._type(params.get("selector", ""), params.get("text", ""))
-            elif action == "scroll":
-                return await self._scroll(params.get("direction", "down"), params.get("amount", 500))
-            elif action == "extract":
-                return await self._extract()
-            elif action == "wait":
-                await asyncio.sleep(params.get("seconds", 2))
-                return {"success": True}
-            elif action == "evaluate":
-                return {"success": True}
-            else:
-                return {"success": False, "error": f"Unknown action: {action}"}
+            return await handler()
         except Exception as e:
-            logger.error(f"Action failed: {action}", error=str(e)[:300])
-            return {"success": False, "error": str(e)}
+            logger.error("Action raised", action=action, error=str(e)[:300])
+            return {"success": False, "error": str(e)[:300]}
+
+    def _selector_for(self, params: dict) -> Optional[str]:
+        element = self.resolve_element(params)
+        if element:
+            return element.selector
+        # A selector straight from params is a fallback for a model that
+        # ignored the element list; it is allowed but rarely correct.
+        return params.get("selector") or None
 
     async def _navigate(self, url: str) -> dict:
-        """Navigate with retry, networkidle, and a small human pause."""
-        timeout = self._settings.browser_timeout_ms
-
-        async def _do_nav():
-            await self._page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        if not url:
+            return {"success": False, "error": "navigate needs a url"}
+        if not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
 
         try:
-            await self._retry(_do_nav, retries=2, label=f"navigate {url[:60]}")
-            # Small random pause to appear human
-            await asyncio.sleep(random.uniform(0.5, 1.5))
-            logger.info("Navigated", url=url[:120])
+            await self._page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=self._settings.browser_timeout_ms,
+            )
+            # Let a client-side redirect land before anyone maps this page's
+            # elements, or every id is stale the moment it is handed over.
+            await self._settle()
+            logger.info("Navigated", requested=url[:80], landed=self._page.url[:80])
             return {"success": True, "url": self._page.url}
         except Exception as e:
-            logger.error("Navigation failed", url=url[:120], error=str(e)[:300])
-            return {"success": False, "error": str(e)}
+            logger.warning("Navigation failed", url=url[:120], error=str(e)[:200])
+            return {"success": False, "error": str(e)[:300]}
 
-    async def _click(self, selector: str) -> dict:
-        """Click with human-like mouse movement and retry."""
-        timeout = self._settings.browser_timeout_ms
+    async def _settle(self, timeout: int = 4000) -> None:
+        """Wait briefly for the page to stop moving. Never raises."""
+        try:
+            await self._page.wait_for_load_state("load", timeout=timeout)
+        except Exception:
+            pass
+        try:
+            await self._page.wait_for_timeout(300)
+        except Exception:
+            pass
 
-        async def _do_click():
-            # Get element bounding box for human-like movement
-            try:
-                box = await self._page.locator(selector).first.bounding_box(timeout=timeout)
-                if box:
-                    target_x = box["x"] + box["width"] / 2 + random.uniform(-3, 3)
-                    target_y = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
-                    await _human_move(self._page, target_x, target_y)
-                    await asyncio.sleep(random.uniform(0.05, 0.2))
-                    await self._page.mouse.click(target_x, target_y)
-                else:
-                    await self._page.click(selector, timeout=timeout)
-            except Exception:
-                # Fallback to standard click
-                await self._page.click(selector, timeout=timeout)
+    async def _click(self, params: dict) -> dict:
+        selector = self._selector_for(params)
+        if not selector:
+            return {"success": False, "error": "click needs a valid element_id"}
+
+        timeout = self._settings.action_timeout_ms
+        locator = self._page.locator(selector).first
+        try:
+            box = await locator.bounding_box(timeout=timeout)
+        except Exception:
+            box = None
 
         try:
-            await self._retry(_do_click, retries=1, label=f"click {selector[:40]}")
-            logger.info("Clicked", selector=selector[:60])
-            await self._page.wait_for_load_state("domcontentloaded", timeout=5000)
-            return {"success": True}
+            if box:
+                x = box["x"] + box["width"] / 2 + random.uniform(-2, 2)
+                y = box["y"] + box["height"] / 2 + random.uniform(-2, 2)
+                await self._move_cursor(x, y)
+                await self._page.mouse.click(x, y)
+            else:
+                await locator.click(timeout=timeout)
         except Exception as e:
-            logger.error("Click failed", selector=selector[:60], error=str(e)[:300])
-            return {"success": False, "error": str(e)}
+            logger.warning("Click failed", selector=selector[:60], error=str(e)[:200])
+            return {"success": False, "error": str(e)[:300]}
 
-    async def _type(self, selector: str, text: str) -> dict:
-        """Type text with human-like keystroke delays."""
-        try:
-            await _human_type(self._page, selector, text, self._settings.browser_timeout_ms)
-            logger.info("Typed text", selector=selector[:60], text=text[:40])
-            return {"success": True}
-        except Exception as e:
-            logger.error("Type failed", selector=selector[:60], error=str(e)[:300])
-            return {"success": False, "error": str(e)}
+        await self._settle()
+        logger.info("Clicked", selector=selector[:60])
+        return {"success": True, "url": self._page.url}
 
-    async def _scroll(self, direction: str = "down", amount: int = 500) -> dict:
-        """Scroll the page with a small natural pause."""
+    async def _type(self, params: dict) -> dict:
+        selector = self._selector_for(params)
+        text = str(params.get("text", ""))
+        if not selector:
+            return {"success": False, "error": "type needs a valid element_id"}
+
+        locator = self._page.locator(selector).first
         try:
-            delta = amount if direction == "down" else -amount
-            await self._page.mouse.wheel(0, delta)
-            await asyncio.sleep(random.uniform(0.8, 1.5))
-            logger.info("Scrolled", direction=direction, amount=amount)
-            return {"success": True}
+            # fill() waits for the field to be editable, clears it, and fires the
+            # input event in one shot. Clicking first then typing per character
+            # loses the race whenever the click itself moves the page.
+            await locator.fill(text, timeout=self._settings.action_timeout_ms)
+
+            if params.get("submit"):
+                await locator.press("Enter", timeout=self._settings.action_timeout_ms)
+                await self._settle(timeout=10000)
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            logger.warning("Type failed", selector=selector[:60], error=str(e)[:200])
+            return {"success": False, "error": str(e)[:300]}
+
+        logger.info("Typed", selector=selector[:60], text=text[:40], submitted=bool(params.get("submit")))
+        return {"success": True, "url": self._page.url}
+
+    async def _hover(self, params: dict) -> dict:
+        selector = self._selector_for(params)
+        if not selector:
+            return {"success": False, "error": "hover needs a valid element_id"}
+        await self._page.locator(selector).first.hover(timeout=self._settings.action_timeout_ms)
+        return {"success": True}
+
+    async def _select(self, params: dict) -> dict:
+        selector = self._selector_for(params)
+        if not selector:
+            return {"success": False, "error": "select needs a valid element_id"}
+        await self._page.locator(selector).first.select_option(
+            str(params.get("value", "")),
+            timeout=self._settings.action_timeout_ms,
+        )
+        await self._settle()
+        return {"success": True}
+
+    async def _keypress(self, key: str) -> dict:
+        await self._page.keyboard.press(key)
+        return {"success": True}
+
+    async def _back(self) -> dict:
+        await self._page.go_back(timeout=self._settings.browser_timeout_ms)
+        return {"success": True, "url": self._page.url}
+
+    async def _scroll(self, direction: str, amount: int) -> dict:
+        delta = amount if direction == "down" else -amount
+        await self._page.mouse.wheel(0, delta)
+        await asyncio.sleep(0.3)  # let lazy content paint
+        return {"success": True}
+
+    async def _wait(self, seconds) -> dict:
+        try:
+            seconds = max(0.0, min(10.0, float(seconds)))
+        except (ValueError, TypeError):
+            seconds = 2.0
+        await asyncio.sleep(seconds)
+        return {"success": True}
 
     async def _extract(self) -> dict:
-        """Extract page content for LLM processing."""
-        try:
-            content = await self._page.locator("body").inner_text()
-            return {"success": True, "content": content}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        content = await self._page.locator("body").inner_text()
+        return {"success": True, "content": content}
 
-    async def extract_html(self) -> str:
-        """Return raw HTML of the current page."""
-        return await self._page.content()
-
-    async def screenshot(self) -> bytes:
-        """Capture a PNG screenshot (fallback for non-screencast callers)."""
-        return await self._page.screenshot(type="png")
+    async def _move_cursor(self, x: float, y: float) -> None:
+        """Move the mouse in a few steps rather than teleporting."""
+        start_x, start_y = self._cursor
+        steps = random.randint(3, 6)
+        for i in range(1, steps + 1):
+            t = i / steps
+            await self._page.mouse.move(
+                start_x + (x - start_x) * t,
+                start_y + (y - start_y) * t,
+            )
+        self._cursor = (x, y)
 
     # ------------------------------------------------------------------
-    # User input forwarding (interactive browser from frontend)
+    # Tabs
+    # ------------------------------------------------------------------
+
+    async def _new_tab(self) -> dict:
+        page = await self._context.new_page()
+        self._pages.append(page)
+        self._active_tab = len(self._pages) - 1
+        self._page = page
+        await self._switch_cdp_to(page)
+        logger.info("New tab opened", tab_id=self._active_tab)
+        return {"success": True, "tab_id": self._active_tab}
+
+    async def _switch_tab(self, tab_id: int) -> dict:
+        if not 0 <= tab_id < len(self._pages):
+            return {"success": False, "error": f"tab_id {tab_id} out of range (0-{len(self._pages) - 1})"}
+        self._active_tab = tab_id
+        self._page = self._pages[tab_id]
+        await self._switch_cdp_to(self._page)
+        return {"success": True, "tab_id": tab_id, "url": self._page.url}
+
+    async def _close_tab(self, tab_id: int) -> dict:
+        if not 0 <= tab_id < len(self._pages):
+            return {"success": False, "error": f"tab_id {tab_id} out of range"}
+        if len(self._pages) == 1:
+            return {"success": False, "error": "Cannot close the only open tab"}
+
+        page = self._pages.pop(tab_id)
+        await page.close()
+        self._active_tab = min(tab_id, len(self._pages) - 1)
+        self._page = self._pages[self._active_tab]
+        await self._switch_cdp_to(self._page)
+        return {"success": True, "closed_tab_id": tab_id, "active_tab_id": self._active_tab}
+
+    async def _get_tabs(self) -> dict:
+        tabs = [
+            {
+                "tab_id": idx,
+                "title": await _safe_title(page),
+                "url": page.url,
+                "active": idx == self._active_tab,
+            }
+            for idx, page in enumerate(self._pages)
+        ]
+        return {"success": True, "tabs": tabs}
+
+    # ------------------------------------------------------------------
+    # Input forwarded from the frontend viewer
     # ------------------------------------------------------------------
 
     async def handle_user_click(self, x: float, y: float) -> None:
-        """Forward a user's mouse click from the frontend to the browser.
-
-        Coordinates should be in the browser viewport space (1920×1080).
-        """
+        """Click at a viewport coordinate on the human's behalf."""
         if not self._page:
             return
         try:
             await self._page.mouse.click(x, y)
+            self._cursor = (x, y)
             logger.info("User click forwarded", x=round(x), y=round(y))
         except Exception as e:
             logger.warning("User click failed", error=str(e)[:200])
 
     async def handle_user_type(self, text: str) -> None:
-        """Forward keyboard text input from the frontend."""
+        """Type text on the human's behalf."""
         if not self._page:
             return
         try:
-            await self._page.keyboard.type(text, delay=50)
-            logger.info("User type forwarded", text=text[:40])
+            await self._page.keyboard.type(text, delay=20)
         except Exception as e:
             logger.warning("User type failed", error=str(e)[:200])
 
     async def handle_user_keypress(self, key: str) -> None:
-        """Forward a special key press (Enter, Tab, Escape, etc.)."""
+        """Press a key on the human's behalf."""
         if not self._page:
             return
         try:
             await self._page.keyboard.press(key)
-            logger.info("User keypress forwarded", key=key)
         except Exception as e:
             logger.warning("User keypress failed", error=str(e)[:200])
 
     async def handle_user_scroll(self, delta_x: float, delta_y: float) -> None:
-        """Forward a scroll event from the frontend."""
+        """Scroll on the human's behalf."""
         if not self._page:
             return
         try:
             await self._page.mouse.wheel(delta_x, delta_y)
-            logger.info("User scroll forwarded", dx=round(delta_x), dy=round(delta_y))
         except Exception as e:
             logger.warning("User scroll failed", error=str(e)[:200])
 
@@ -570,19 +690,29 @@ class BrowserController:
     # Human-in-the-loop CAPTCHA
     # ------------------------------------------------------------------
 
-    async def pause_for_human_captcha(self) -> None:
-        """Block the agent loop until a human has solved the CAPTCHA.
-
-        The frontend calls ``resume_after_captcha()`` to unblock.
-        """
+    async def pause_for_human_captcha(self, timeout: float) -> bool:
+        """Block until the human solves the CAPTCHA. False if *timeout* elapsed."""
         self._captcha_event.clear()
         self._waiting_for_human = True
-        logger.info("Agent paused — waiting for human to solve CAPTCHA")
-        await self._captcha_event.wait()
-        self._waiting_for_human = False
-        logger.info("Agent resumed after human CAPTCHA solve")
+        logger.info("Waiting for human to solve CAPTCHA", timeout=timeout)
+        try:
+            await asyncio.wait_for(self._captcha_event.wait(), timeout=timeout)
+            logger.info("Human solved CAPTCHA")
+            return True
+        except asyncio.TimeoutError:
+            logger.warning("CAPTCHA wait timed out")
+            return False
+        finally:
+            self._waiting_for_human = False
+            self._captcha_event.set()
 
     def resume_after_captcha(self) -> None:
-        """Unblock the agent loop after the human has solved the CAPTCHA."""
+        """Unblock the agent — the human says the CAPTCHA is solved."""
         self._captcha_event.set()
 
+
+async def _safe_title(page: Page) -> str:
+    try:
+        return await page.title()
+    except Exception:
+        return ""

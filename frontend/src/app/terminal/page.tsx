@@ -94,13 +94,14 @@ export default function TerminalPage() {
             });
         } else if (cmd === "stats") {
             const completed = tasks.filter(t => t.status === "completed").length;
+            const failed = tasks.filter(t => t.status === "failed").length;
             const rate = tasks.length > 0 ? Math.round((completed / tasks.length) * 100) : 0;
             setLogs(prev => [...prev,
-            { timestamp: now, level: "SYS", message: `Success rate: ${rate}% | Total: ${tasks.length} | Uptime: ${Math.round(Math.random() * 48 + 1)}h` },
+            { timestamp: now, level: "SYS", message: `Success rate: ${rate}% | Completed: ${completed} | Failed: ${failed} | Total: ${tasks.length}` },
             ]);
         } else if (cmd === "version") {
             setLogs(prev => [...prev,
-            { timestamp: now, level: "SYS", message: "Kinetic AI v4.2.0 | Liquid Core | Playwright 1.40 | GPT-4o-mini" },
+            { timestamp: now, level: "SYS", message: "AI Web Automation Agent v0.2.0 | FastAPI + Playwright + Next.js" },
             ]);
         } else {
             setLogs(prev => [...prev,

@@ -1,52 +1,137 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { getWebSocketUrl, TaskStep, UiEvent } from "@/lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+    ApprovalRequest,
+    ControlState,
+    TaskStep,
+    UiEvent,
+    getWebSocketUrl,
+} from "@/lib/api";
+
+const TERMINAL_STATUSES = ["completed", "failed", "cancelled"];
+const RECONNECT_DELAY_MS = 3000;
 
 /**
- * Hook for subscribing to real-time task execution updates via WebSocket.
+ * Subscribes to a task's live event stream and sends user input back.
  *
- * Upgraded to support:
- * - Bidirectional communication (send user actions back to backend)
- * - Screencast frame handling (JPEG stream)
- * - CAPTCHA detection events
- * - Viewport dimension tracking
+ * Every message from the backend has the same envelope:
+ *   { task_id, step, action, raw_event, ui_event?, timestamp }
+ * so there is one place that reads it, here.
  */
 export function useTaskWebSocket(taskId: string) {
     const [steps, setSteps] = useState<TaskStep[]>([]);
     const [uiEvents, setUiEvents] = useState<UiEvent[]>([]);
     const [status, setStatus] = useState<string>("");
     const [connected, setConnected] = useState(false);
-    const [screenshot, setScreenshot] = useState<string | null>(null);
-    const [captchaDetected, setCaptchaDetected] = useState(false);
-    const [captchaType, setCaptchaType] = useState<string>("");
-    const [viewport, setViewport] = useState<{ width: number; height: number }>({
-        width: 1920,
-        height: 1080,
-    });
+    const [frame, setFrame] = useState<string | null>(null);
+    const [captcha, setCaptcha] = useState<string | null>(null);
+    const [controlState, setControlState] = useState<ControlState>("AI_ACTIVE");
+    const [approval, setApproval] = useState<ApprovalRequest | null>(null);
+    const [viewport, setViewport] = useState({ width: 1440, height: 900 });
+
     const wsRef = useRef<WebSocket | null>(null);
     const statusRef = useRef(status);
 
-    // Keep statusRef in sync without re-triggering effects
     useEffect(() => {
         statusRef.current = status;
     }, [status]);
 
-    /**
-     * Send a user action to the backend via WebSocket.
-     * Used for interactive browser control and CAPTCHA resume.
-     */
-    const sendAction = (action: Record<string, unknown>) => {
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify(action));
+    const sendAction = useCallback((action: Record<string, unknown>) => {
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(action));
         }
-    };
+    }, []);
 
     useEffect(() => {
         if (!taskId) return;
 
         let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
         let unmounted = false;
+
+        function handleMessage(raw: MessageEvent) {
+            let data: any;
+            try {
+                data = JSON.parse(raw.data);
+            } catch {
+                return;
+            }
+
+            const action: string = data.action ?? "";
+            const event = data.raw_event ?? {};
+
+            // Screencast frames are high-frequency and never belong in the feed.
+            if (action === "screencast_frame") {
+                if (event.image) setFrame(event.image);
+                return;
+            }
+
+            if (data.status) {
+                setStatus(data.status);
+                statusRef.current = data.status;
+            }
+
+            switch (action) {
+                case "browser_launched":
+                    if (event.viewport) setViewport(event.viewport);
+                    break;
+                case "captcha_detected":
+                    setCaptcha(event.captcha_type ?? "unknown");
+                    break;
+                case "captcha_solved":
+                case "captcha_timeout":
+                    setCaptcha(null);
+                    break;
+                case "control_state_changed":
+                    if (event.current_state) setControlState(event.current_state);
+                    break;
+                case "approval_requested":
+                    setApproval({
+                        action: event.action ?? "",
+                        description: event.description ?? "",
+                        reason: event.reason ?? "",
+                        riskLevel: event.risk_level ?? "high",
+                        timeoutSeconds: event.timeout_seconds ?? 0,
+                    });
+                    break;
+                case "approval_granted":
+                case "approval_denied":
+                    setApproval(null);
+                    break;
+            }
+
+            if (data.ui_event) {
+                setUiEvents((prev) => [...prev, data.ui_event]);
+            }
+
+            // The timeline shows real steps only, not lifecycle chatter.
+            if (typeof data.step === "number" && data.step > 0) {
+                const step: TaskStep = {
+                    step: data.step,
+                    action,
+                    description: event.description ?? action,
+                    status: event.status ?? "completed",
+                    details: event,
+                    timestamp: data.timestamp,
+                };
+
+                setSteps((prev) => {
+                    const idx = prev.findIndex(
+                        (p) => p.step === step.step && p.action === step.action
+                    );
+                    if (idx < 0) return [...prev, step];
+                    const next = [...prev];
+                    next[idx] = step;
+                    return next;
+                });
+            }
+
+            if (TERMINAL_STATUSES.includes(data.status)) {
+                setApproval(null);
+                setCaptcha(null);
+            }
+        }
 
         function connect() {
             if (unmounted) return;
@@ -57,100 +142,17 @@ export function useTaskWebSocket(taskId: string) {
             ws.onopen = () => {
                 if (!unmounted) setConnected(true);
             };
-
-            ws.onmessage = (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-
-                    // Update status
-                    if (data.status) {
-                        setStatus(data.status);
-                        statusRef.current = data.status;
-                    }
-
-                    // Handle base64 Screenshot (legacy PNG) or Screencast Frame (live JPEG)
-                    if (data.action === "screenshot" || data.action === "screencast_frame"
-                        || data.raw_event?.action === "screenshot" || data.raw_event?.action === "screencast_frame") {
-                        const img = data.details?.image || data.raw_event?.details?.image;
-                        if (img) setScreenshot(img);
-                        return;
-                    }
-
-                    // Handle CAPTCHA events
-                    if (data.action === "captcha_detected") {
-                        setCaptchaDetected(true);
-                        setCaptchaType(data.raw_event?.captcha_type || data.details?.captcha_type || "unknown");
-                    }
-                    if (data.action === "captcha_solved") {
-                        setCaptchaDetected(false);
-                        setCaptchaType("");
-                    }
-
-                    // Track viewport dimensions from browser_launched
-                    if (data.action === "browser_launched" && data.raw_event?.viewport) {
-                        setViewport(data.raw_event.viewport);
-                    }
-
-                    // Append UI Chat Events
-                    if (data.ui_event) {
-                        setUiEvents((prev) => [...prev, data.ui_event]);
-                    }
-
-                    // Add or Update step timeline
-                    if (data.step !== undefined) {
-                        const action = data.action || data.raw_event?.action || "unknown";
-                        const stepStatus = data.raw_event?.status || data.details?.status || "completed";
-                        const rawDetails = data.raw_event || data.details || {};
-                        const description = rawDetails.description || action;
-
-                        const newStep: TaskStep = {
-                            step: data.step,
-                            action,
-                            description,
-                            status: stepStatus,
-                            details: rawDetails,
-                            timestamp: data.timestamp,
-                            ui_event: data.ui_event,
-                            raw_event: rawDetails,
-                        };
-
-                        setSteps((prev) => {
-                            const existingIdx = prev.findIndex(
-                                (p) => p.step === newStep.step && p.action === newStep.action
-                            );
-                            if (existingIdx >= 0) {
-                                const updated = [...prev];
-                                updated[existingIdx] = newStep;
-                                return updated;
-                            }
-                            return [...prev, newStep];
-                        });
-                    }
-
-                    // Auto-close on terminal states
-                    if (["completed", "failed", "cancelled"].includes(data.status)) {
-                        ws.close();
-                    }
-                } catch (e) {
-                    console.error("WebSocket parse error:", e);
-                }
+            ws.onmessage = handleMessage;
+            ws.onerror = () => {
+                if (!unmounted) setConnected(false);
             };
-
             ws.onclose = () => {
                 if (unmounted) return;
                 setConnected(false);
-
-                // Only reconnect if still in a non-terminal state
-                const currentStatus = statusRef.current;
-                if (currentStatus === "running" || currentStatus === "queued" || currentStatus === "") {
-                    reconnectTimer = setTimeout(() => {
-                        if (!unmounted) connect();
-                    }, 3000);
+                // Only chase the connection while the task could still be running.
+                if (!TERMINAL_STATUSES.includes(statusRef.current)) {
+                    reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
                 }
-            };
-
-            ws.onerror = () => {
-                if (!unmounted) setConnected(false);
             };
         }
 
@@ -159,21 +161,23 @@ export function useTaskWebSocket(taskId: string) {
         return () => {
             unmounted = true;
             if (reconnectTimer) clearTimeout(reconnectTimer);
-            if (wsRef.current) {
-                wsRef.current.onclose = null;
-                wsRef.current.close();
+            const ws = wsRef.current;
+            if (ws) {
+                ws.onclose = null;
+                ws.close();
             }
         };
-    }, [taskId]); // Only re-run when taskId changes, NOT status
+    }, [taskId]);
 
     return {
         steps,
         uiEvents,
         status,
         connected,
-        screenshot,
-        captchaDetected,
-        captchaType,
+        frame,
+        captcha,
+        controlState,
+        approval,
         viewport,
         sendAction,
     };

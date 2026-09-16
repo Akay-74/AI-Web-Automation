@@ -1,13 +1,13 @@
-<div align="center">
+                <div align="center">
 
 # 🤖 AI Web Automation Agent
 
 **Give it a goal. Watch it browse.**
 
-A production-grade platform where users type a natural-language goal and an autonomous AI agent controls a real browser to complete it — extracting, validating, and returning structured results in real time.
+Type a natural-language goal and an autonomous agent drives a real browser to carry it out — looking at each page, deciding the next action, and returning structured results while you watch it live.
 
 [![Python](https://img.shields.io/badge/Python-3.13-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.135-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Next.js](https://img.shields.io/badge/Next.js-14-000000?style=flat-square&logo=nextdotjs&logoColor=white)](https://nextjs.org)
 [![Playwright](https://img.shields.io/badge/Playwright-Chromium-2EAD33?style=flat-square&logo=playwright&logoColor=white)](https://playwright.dev)
 [![OpenAI](https://img.shields.io/badge/LLM-OpenRouter%2FOpenAI-412991?style=flat-square&logo=openai&logoColor=white)](https://openrouter.ai)
@@ -21,77 +21,71 @@ A production-grade platform where users type a natural-language goal and an auto
 
 ## 🎯 What It Does
 
-Type a goal like **"Find the cheapest RTX 4060 laptop on Amazon"** and the agent:
+Type a goal like **"Search Wikipedia for web scraping and extract the article summary"** and the agent:
 
-1. 🧠 **Plans** a step-by-step browser action sequence using GPT-4o-mini
-2. 🌐 **Controls** a headless Chromium browser using Playwright
-3. 🖱️ **Navigates**, types, clicks, scrolls, and extracts data from live websites
-4. 🛡️ **Bypasses Detectors** with Playwright stealth, bezier-curve mouse movements, and random typing delays
-5. ✅ **Validates** results against your constraints (GPU model, price cap, brand)
-6. 🔄 **Replans** automatically if constraints aren't satisfied
-7. 📡 **Streams** a live CDP screencast to your browser via WebSocket
-8. 🖱️ **Interactive Mode** lets you click/scroll inside the screencast, and pauses for **Human CAPTCHA** solving natively in the UI
+1. 👁️ **Looks** at the current page — every interactive element, the headings, the visible text
+2. 🧠 **Decides** the single next action against *that* page, referring to elements by id
+3. 🖱️ **Acts** — navigates, types, clicks, scrolls, switches tabs
+4. 🔁 **Repeats**, so a page that loaded differently than expected changes the next decision
+5. 📦 **Extracts** structured rows once the data it needs is on screen
+6. 🛡️ **Asks first** before anything irreversible (placing an order, deleting an account, entering a password)
+7. 🤝 **Hands over** to you on a login or CAPTCHA wall — and takes the wheel back when you are done
+8. 📡 **Streams** a live CDP screencast you can click straight into
+
+### Why observe-then-decide
+
+Planning a whole run up front means inventing CSS selectors for pages you have not loaded. Those selectors miss, and the run dies on step two. Here the perception layer assigns an `element_id` to every interactive element on the page it just rendered, and the planner may only choose from that list — so it cannot invent a target that isn't there.
 
 ---
 
-## 🖥️ How It Works — Live Demo Flow
+## 🖥️ How It Works — Live Flow
 
-### Step 1: Submit a Goal
-User types a natural language goal in the **New Task** form.
-
-```
-Goal: "Find the cheapest RTX 4060 laptop on Amazon under $1000, preferably ASUS"
-```
-
-### Step 2: Agent Plans & Executes
-The AI Planner decomposes the goal into an action plan (single LLM call), then the Agent Loop executes each step:
+### Step 1: Submit a goal
 
 ```
-[Step 1] navigate → https://amazon.com
-[Step 2] type     → searchbox: "RTX 4060 laptop"
-[Step 3] click    → search button
-[Step 4] scroll   → loading more results
-[Step 5] extract  → 12 product listings found
-[Step 6] validate → 8 match RTX 4060, 4 filtered out (wrong GPU)
-[Step 7] evaluate → goal met: cheapest valid result = $899.99
+Goal: "Search Wikipedia for 'Playwright software' and extract the title and summary"
 ```
 
-### Step 3: Structured Results Returned
+### Step 2: The agent cycles, one page at a time
+
+```
+[observe] about:blank              → 0 elements
+[decide ] navigate                 → https://www.wikipedia.org/
+[observe] wikipedia.org            → 44 elements  ([31] input "Search Wikipedia", ...)
+[decide ] type  element_id=31      → "Playwright software", submit
+[observe] search results page      → 78 elements  ([10] a "Playwright (software)", ...)
+[decide ] click element_id=10
+[observe] en.wikipedia.org/wiki/…  → 312 elements
+[decide ] extract schema=article   → 1 item
+[decide ] finish                   → "Extracted the title and summary"
+```
+
+Real output from that run:
+
 ```json
 {
-  "type": "product_comparison",
-  "summary": "Found 8 RTX 4060 laptops. Cheapest valid: ASUS TUF A15 at $899.99",
   "items": [
     {
-      "name": "ASUS TUF Gaming A15 RTX 4060",
-      "price": 899.99,
-      "currency": "USD",
-      "rating": 4.5,
-      "is_valid": true,
-      "validation_reason": "GPU matches RTX 4060, brand matches ASUS, price under $1000",
-      "specs": { "ram": "16GB", "storage": "512GB SSD", "display": "15.6\" 144Hz" }
-    },
-    {
-      "name": "MSI Thin 15 RTX 4060",
-      "price": 949.00,
-      "is_valid": true,
-      "validation_reason": "GPU matches RTX 4060, price under $1000"
+      "title": "Playwright (software)",
+      "source": "Wikipedia",
+      "summary": "Playwright is an open-source automation library for browser testing and web scraping developed by Microsoft and launched on 31 January 2020, which has since become popular among programmers and web developers.",
+      "url": "https://en.wikipedia.org/wiki/Playwright_(software)",
+      "published_date": "January 31, 2020"
     }
   ]
 }
 ```
 
-### Step 4: Live WebSocket Feed (what the frontend displays)
+### Step 3: Live feed in the UI
+
 ```
-🟡 [10:00:01] Task started
-📋 [10:00:02] Plan created: 7 steps
-🌐 [10:00:03] Navigating to amazon.com
-⌨️  [10:00:05] Typing search query...
-🖱️  [10:00:06] Clicking search button
-📜 [10:00:09] Scrolling for more results
-🔍 [10:00:12] Extracting 12 product listings
-✅ [10:00:14] Validation: 8/12 items pass constraints
-🏁 [10:00:15] Task completed — 8 valid results found
+ℹ️  Task started
+ℹ️  Browser ready
+🌐 Opening https://www.wikipedia.org/
+⌨️  Typing a field: "Playwright software" and submitting
+🖱️  Clicking: the Playwright (software) article link
+🔍 Extracted 1 item(s) — 1 total
+🏁 Finishing: Extracted the title and summary
 ```
 
 ---
@@ -102,53 +96,50 @@ The AI Planner decomposes the goal into an action plan (single LLM call), then t
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        FRONTEND (Next.js 14)                        │
 │  ┌───────────┐  ┌──────────────────┐  ┌──────────┐  ┌───────────┐  │
-│  │ Task Form │  │ Agent Monitor    │  │ Results  │  │  History  │  │
-│  │ (goal in) │  │ (WebSocket live) │  │Dashboard │  │           │  │
+│  │ Task Form │  │ Live Browser     │  │ Results  │  │  History  │  │
+│  │ (goal in) │  │ Panel + Feed     │  │  Cards   │  │           │  │
 │  └─────┬─────┘  └────────┬─────────┘  └────┬─────┘  └───────────┘  │
-└────────┼────────────────┼───────────────────┼─────────────────────-─┘
-         │                │                   │
-         ▼                ▼                   ▼ REST / WebSocket
-┌────────────────────────────────────────────────────────────────────┐
-│                       BACKEND (FastAPI)                             │
-│  ┌──────────┐  ┌──────────────┐  ┌─────────────┐  ┌─────────────┐ │
-│  │ REST API │  │ WebSocket Hub│  │Task Manager │  │  Auth Layer │ │
-│  └────┬─────┘  └──────┬───────┘  └──────┬──────┘  └─────────────┘ │
-└───────┼───────────────┼─────────────────┼──────────────────────────┘
-        │               │                 │
-        ▼               ▼                 ▼
-  ┌───────────┐  ┌────────────┐  ┌────────────────────────────────┐
-  │ SQLite /  │  │ Redis      │  │       AGENT WORKER             │
-  │ PostgreSQL│  │ PubSub +   │  │  ┌──────────┐  ┌───────────┐  │
-  └───────────┘  │ Task Queue │  │  │ AI       │→ │ Browser   │  │
-                 └────────────┘  │  │ Planner  │  │Controller │  │
-                                 │  └──────────┘  │(Playwright)│  │
-  ┌────────────┐                 │                └─────┬───────┘  │
-  │   FAISS    │◄────────────────│       ┌──────────────▼───────┐  │
-  │  Vector    │                 │       │ Page Analyzer +      │  │
-  │  Memory    │                 │       │ Data Extractor       │  │
-  └────────────┘                 │       └──────────────┬───────┘  │
-                                 │  ┌───────────────────▼────────┐ │
-                                 │  │ Result Evaluator           │ │
-                                 │  │ + Constraint Validator     │ │
-                                 │  └────────────────────────────┘ │
-                                 └────────────────────────────────--┘
+└────────┼────────────────┼───────────────────┼──────────────────────┘
+         │ REST            │ WebSocket (both ways)
+         ▼                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         BACKEND (FastAPI)                           │
+│  ┌──────────┐   ┌──────────────────┐   ┌────────────────────────┐  │
+│  │ REST API │   │ ConnectionManager│◄──│ Task Runner            │  │
+│  └────┬─────┘   │ (single event    │   │ (background coroutine) │  │
+│       │         │  sink)           │   └───────────┬────────────┘  │
+│       ▼         └──────────────────┘               │               │
+│  ┌──────────────┐                      ┌───────────▼────────────┐  │
+│  │ SQLite /     │                      │      AGENT LOOP        │  │
+│  │ PostgreSQL   │                      │                        │  │
+│  └──────────────┘                      │  ┌──────────────────┐  │  │
+│                                        │  │ 1. observe       │  │  │
+│  ┌───────────────────────────────┐     │  │    ElementMapper │  │  │
+│  │ Agent Registry                │◄────│  │    PageObserver  │  │  │
+│  │ task_id → AgentLoop + Browser │     │  └────────┬─────────┘  │  │
+│  │ (routes your clicks into the  │     │  ┌────────▼─────────┐  │  │
+│  │  browser the agent is using)  │     │  │ 2. decide        │  │  │
+│  └───────────────────────────────┘     │  │    AIPlanner     │  │  │
+│                                        │  └────────┬─────────┘  │  │
+│                                        │  ┌────────▼─────────┐  │  │
+│                                        │  │ 3. gate          │  │  │
+│                                        │  │  SafetyValidator │  │  │
+│                                        │  │  ControlStateM.  │  │  │
+│                                        │  └────────┬─────────┘  │  │
+│                                        │  ┌────────▼─────────┐  │  │
+│                                        │  │ 4. act           │  │  │
+│                                        │  │ BrowserController│  │  │
+│                                        │  │   (Playwright)   │  │  │
+│                                        │  └──────────────────┘  │  │
+│                                        └────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Dual Execution Mode (Auto-Detected)
-```
-POST /api/tasks/{id}/start
-    ↓
-Is Redis reachable?
-    YES → rpush("task_queue", task_id)     ← distributed worker picks it up
-    NO  → asyncio.create_task(run_agent()) ← runs in-process (local dev)
+### One execution path, on purpose
 
-GET /ws/tasks/{id}
-    ↓
-Is Redis reachable?
-    YES → subscribe to "task_updates:{id}" PubSub channel
-    NO  → poll DB every 500ms for new TaskLog rows
-```
-No configuration needed — the system adapts automatically.
+The agent runs as a background coroutine **inside the API process**. That is not a shortcut — the live browser panel forwards your clicks and keystrokes into the same `BrowserController` object the agent is driving, looked up through a process-local registry. Move execution to a separate worker process and that handover cannot work at all.
+
+For the same reason there is one event sink. The loop hands every event to `ConnectionManager`, which writes it to the task log and pushes it to every open socket. No broker, no database polling.
 
 ---
 
@@ -156,47 +147,47 @@ No configuration needed — the system adapts automatically.
 
 | Component | File | Description |
 |---|---|---|
-| **AI Planner** | `agent/planner.py` | Converts natural language goal → JSON action plan (1 LLM call; uses deterministic templates first) |
-| **Agent Loop** | `agent/loop.py` | Orchestrates plan execution, handles replanning, broadcasts status |
-| **Browser Controller** | `browser/controller.py` | Playwright wrapper: navigate, click, type, scroll, screenshot, extract |
-| **Page Analyzer** | `browser/analyzer.py` | Converts raw HTML → compressed inner text for reliable LLM parsing |
-| **Data Extractor** | `browser/extractor.py` | CSS heuristic extraction → LLM fallback; outputs structured JSON |
-| **Agent Registry** | `agent/registry.py` | Maps active tasks to browser controllers for routing interactive WebSocket input |
-| **Result Validator** | `agent/validator.py` | Enforces GPU model, price cap, brand constraints with regex |
-| **Result Evaluator** | `agent/evaluator.py` | Deterministic completion check → LLM verification if inconclusive |
-| **Vector Memory** | `memory/vector.py` | FAISS + `text-embedding-3-small`; optional, gracefully disabled |
-| **WebSocket Hub** | `api/routes/websocket.py` | Bidirectional: streams status/screencast and receives user clicks/keystrokes |
+| **Agent Loop** | `agent/loop.py` | The observe → decide → gate → act cycle, plus every bounded wait |
+| **AI Planner** | `agent/planner.py` | One LLM call per step: current page + history → the next action |
+| **Element Mapper** | `perception/element_mapper.py` | Assigns `element_id` to each interactive element; resolves ids back to selectors |
+| **Page Observer** | `perception/page_observer.py` | Headings and visible text; detects login / 2FA walls that need a human |
+| **Browser State** | `browser/state.py` | Normalized page description, and the summary the planner actually reads |
+| **Browser Controller** | `browser/controller.py` | Playwright wrapper: actions, CDP screencast, tabs, CAPTCHA, input forwarding |
+| **Data Extractor** | `browser/extractor.py` | Page text → structured rows against a schema (product / job / article / generic) |
+| **Safety Validator** | `safety/permissions.py` | Flags only irreversible actions, judged on the resolved element |
+| **Control State Machine** | `agent/control.py` | AI ↔ human handover and approval, with a timeout on every wait |
+| **Task Runner** | `agent/runner.py` | Runs one loop, persists events and results, updates task status |
+| **Agent Registry** | `agent/registry.py` | `task_id` → live loop and browser, so the UI can reach them |
+| **WebSocket Hub** | `api/routes/websocket.py` | Streams events out, accepts clicks and control commands in |
 
 ---
 
-## 🔍 Validation Engine — Proof of Work
+## 🛡️ Safety Gate — Narrow On Purpose
 
-The `ResultValidator` parses constraints directly from the goal text:
+An over-eager gate is not a safe gate. If "Submit search" needs approval then every task stops dead waiting for a human, and the agent is useless. So the gate asks only about things you cannot undo:
 
 ```python
-# Goal: "Find cheapest RTX 4060 laptop under $1000, ASUS brand"
-#
-# Validator extracts:
-#   gpu_required  = "RTX 4060"
-#   price_cap     = 1000.0
-#   brand_filter  = "asus"
-#
-# Each result gets:
-{
-  "name": "ASUS TUF A15 RTX 4060",
-  "price": 899.99,
-  "is_valid": True,
-  "validation_reason": "GPU matches RTX 4060 ✓, price $899.99 < $1000 ✓, brand ASUS ✓"
-}
-{
-  "name": "Lenovo IdeaPad RTX 4050",
-  "price": 799.99,
-  "is_valid": False,
-  "validation_reason": "GPU mismatch: found RTX 4050, requires RTX 4060 ✗"
-}
+# Allowed without asking — ordinary browsing
+"Submit search"     "Sign in"      "Add to cart"     "Save changes"
+"Next page"         "Reply"        "Order history"   "Account settings"
+
+# Requires your approval — irreversible
+"Place your order"  "Buy now"      "Confirm payment"    "Proceed to checkout"
+"Subscribe"         "Transfer funds"  "Delete my account"
+# ...plus typing into any real password field, and any click on paypal/stripe/a bank
 ```
 
-If 0 valid items are found after extraction, the agent **automatically replans** and tries again.
+It classifies the **resolved element** — the accessible name and input type read off the live page — not the model's prose description of what it thinks it is doing.
+
+### Nothing waits forever
+
+| Wait | Bound | On timeout |
+|---|---|---|
+| Human approval of a risky action | `APPROVAL_TIMEOUT_SECONDS` (180s) | Treated as declined; the agent moves on |
+| Paused for a human (login, 2FA, CAPTCHA) | `HUMAN_PAUSE_TIMEOUT_SECONDS` (300s) | Task fails with a plain reason |
+| Same action repeated with no effect | `MAX_REPEATED_ACTIONS` (3) | Task stops — the page is not responding to it |
+| Actions failing back to back | `MAX_CONSECUTIVE_FAILURES` (4) | Task stops with the last error |
+| Total steps | `MAX_STEPS_PER_TASK` (25) | Returns whatever was collected |
 
 ---
 
@@ -205,9 +196,10 @@ If 0 valid items are found after extraction, the agent **automatically replans**
 ### Prerequisites
 - Python 3.11+
 - Node.js 18+
-- An [OpenRouter](https://openrouter.ai) API key (free tier available)
+- An [OpenRouter](https://openrouter.ai) or OpenAI API key
 
-### 1. Backend Setup
+### 1. Backend
+
 ```bash
 cd backend
 python3 -m venv venv
@@ -227,7 +219,10 @@ EOF
 uvicorn app.main:app --reload --port 8000
 ```
 
-### 2. Frontend Setup
+Model ids are namespaced automatically: with an OpenRouter base URL, `gpt-4o-mini` is sent as `openai/gpt-4o-mini`. Set `OPENAI_MODEL` to use anything else.
+
+### 2. Frontend
+
 ```bash
 # In a new terminal
 cd frontend
@@ -235,25 +230,33 @@ npm install
 npm run dev
 ```
 
-**Open [http://localhost:3000](http://localhost:3000)** — the app is ready.
+**Open [http://localhost:3000](http://localhost:3000)** — the app is ready. SQLite is created on first run; nothing else to stand up.
 
-> **Note:** The backend uses SQLite locally — no Postgres or Redis needed.
+### Useful settings
+
+All optional, all via `backend/.env`:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENAI_MODEL` | `gpt-4o-mini` | Any OpenAI-compatible chat model |
+| `BROWSER_HEADLESS` | `true` | `false` to watch the real window |
+| `BROWSER_USER_DATA_DIR` | — | Point at a Chrome profile to reuse existing logins |
+| `VIEWPORT_WIDTH` / `VIEWPORT_HEIGHT` | `1440` / `900` | Browser size; the screencast matches it 1:1 |
+| `SCREENCAST_FPS` / `SCREENCAST_QUALITY` | `8` / `55` | Raise for a smoother stream, at more bandwidth |
+| `MAX_STEPS_PER_TASK` | `25` | Step budget per task |
 
 ---
 
-## 🐳 Production: Docker Compose (Full Stack)
-
-Runs Postgres + Redis + distributed workers:
+## 🐳 Docker Compose
 
 ```bash
-# Set your API key first
 echo "OPENAI_API_KEY=sk-or-v1-your-key" >> backend/.env
 echo "OPENAI_BASE_URL=https://openrouter.ai/api/v1" >> backend/.env
 
 docker compose up --build
 ```
 
-Services launched: `postgres`, `redis`, `backend` (FastAPI), `worker` (task processor), `frontend` (Next.js).
+Services: `postgres`, `backend` (FastAPI + the agent), `frontend` (Next.js).
 
 ---
 
@@ -262,19 +265,17 @@ Services launched: `postgres`, `redis`, `backend` (FastAPI), `worker` (task proc
 ```bash
 cd backend
 source venv/bin/activate
+pytest
+```
 
-# Unit tests — validation logic (no network, runs in < 1s)
-pytest tests/test_validation_gpu.py -v
+87 tests, no network and no browser, about a second:
 
-# Expected output:
-# PASSED tests/test_validation_gpu.py::test_rtx4060_valid
-# PASSED tests/test_validation_gpu.py::test_rtx4050_invalid
-# PASSED tests/test_validation_gpu.py::test_price_cap
-# PASSED tests/test_validation_gpu.py::test_brand_filter
-# 4 passed in 0.12s
-
-# Integration test (requires OPENAI_API_KEY + Playwright)
-pytest tests/test_task_execution_local.py -v
+```
+tests/test_agent_loop.py       # the cycle: re-observation, stall + failure guards, approval, cancel
+tests/test_browser_state.py    # the page summary the planner reads; config/model-id handling
+tests/test_control.py          # AI ↔ human handover; every wait is bounded
+tests/test_planner.py          # surviving malformed or oddly-shaped model JSON
+tests/test_safety.py           # ordinary clicks pass, irreversible ones are gated
 ```
 
 ---
@@ -285,31 +286,28 @@ pytest tests/test_task_execution_local.py -v
 .
 ├── backend/
 │   ├── app/
-│   │   ├── main.py              # FastAPI app, CORS, DB init
-│   │   ├── config.py            # Pydantic Settings (loads .env by absolute path)
+│   │   ├── main.py                 # FastAPI app, CORS, DB init
+│   │   ├── config.py               # Pydantic Settings (loads .env by absolute path)
 │   │   ├── api/routes/
-│   │   │   ├── tasks.py         # Task CRUD + /start + /cancel + /logs
-│   │   │   ├── results.py       # Results endpoints
-│   │   │   └── websocket.py     # WS: Redis PubSub or DB polling fallback
-│   │   ├── models/              # SQLAlchemy ORM (sqlalchemy.Uuid — SQLite safe)
-│   │   ├── schemas/             # Pydantic v2 request/response schemas
-│   │   ├── services/
-│   │   │   ├── agent/           # loop.py, planner.py, evaluator.py, validator.py
-│   │   │   ├── browser/         # controller.py, extractor.py, analyzer.py
-│   │   │   └── memory/          # vector.py (FAISS, optional)
-│   │   └── workers/
-│   │       └── task_worker.py   # Redis queue consumer (production)
-│   └── tests/
-│       ├── test_validation_gpu.py        # 4 unit tests, no deps
-│       └── test_task_execution_local.py  # Integration test
+│   │   │   ├── tasks.py            # Task CRUD + /start + /cancel + /logs
+│   │   │   ├── results.py          # Results endpoints
+│   │   │   └── websocket.py        # WS: events out, user input in
+│   │   ├── models/                 # SQLAlchemy ORM (sqlalchemy.Uuid — SQLite safe)
+│   │   ├── schemas/                # Pydantic v2 request/response schemas
+│   │   └── services/
+│   │       ├── agent/              # loop.py, planner.py, control.py, runner.py, registry.py
+│   │       ├── browser/            # controller.py, state.py, extractor.py
+│   │       ├── perception/         # element_mapper.py, page_observer.py
+│   │       └── safety/             # permissions.py
+│   └── tests/                      # 87 offline unit tests
 ├── frontend/
 │   └── src/
-│       ├── app/                 # Next.js App Router pages
-│       ├── components/          # ActionTimeline, AgentChatPanel, LiveBrowserPanel
-│       ├── hooks/               # useTaskWebSocket.ts
-│       └── lib/                 # api.ts (typed API client)
+│       ├── app/                    # Next.js App Router pages
+│       ├── components/             # LiveBrowserPanel, ExecutionFeed, ResultCard, Sidebar
+│       ├── hooks/                  # useTaskWebSocket.ts
+│       └── lib/                    # api.ts (typed API client)
 ├── docker-compose.yml
-└── DEVELOPER_ONBOARDING.md      # Full architecture & bug history
+└── DEVELOPER_ONBOARDING.md
 ```
 
 ---
@@ -319,22 +317,40 @@ pytest tests/test_task_execution_local.py -v
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/api/tasks` | Create a new task |
-| `GET` | `/api/tasks/{id}` | Get task details & status |
+| `GET` | `/api/tasks` | List tasks (filter by `status`, paginate) |
+| `GET` | `/api/tasks/{id}` | Task details & status |
 | `POST` | `/api/tasks/{id}/start` | Start agent execution |
-| `POST` | `/api/tasks/{id}/cancel` | Cancel running task |
-| `GET` | `/api/tasks/{id}/logs` | Execution step-by-step logs |
-| `GET` | `/api/tasks/{id}/results` | Extracted & validated results |
-| `WS` | `/ws/tasks/{id}` | Real-time streaming updates |
+| `POST` | `/api/tasks/{id}/cancel` | Cancel a task, stopping a running agent |
+| `GET` | `/api/tasks/{id}/logs` | Step-by-step event log |
+| `GET` | `/api/tasks/{id}/results` | Extracted rows |
+| `DELETE` | `/api/tasks/{id}` | Delete a task with its logs and results |
+| `WS` | `/ws/tasks/{id}` | Live events out; clicks and control commands in |
+| `GET` | `/health` | Liveness, and whether an LLM key is configured |
 
-**Create Task Example:**
+**Create and run a task:**
+
 ```bash
-curl -X POST http://localhost:8000/api/tasks \
+TASK=$(curl -s -X POST http://localhost:8000/api/tasks \
   -H "Content-Type: application/json" \
-  -d '{"goal": "Find the cheapest RTX 4060 laptop on Amazon", "priority": 1}'
+  -d '{"goal": "Search Wikipedia for web scraping and extract the article summary"}')
 
-# Response:
-# {"id": "a1b2c3d4-...", "status": "pending", "created_at": "2026-03-29T..."}
+ID=$(echo "$TASK" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+curl -s -X POST "http://localhost:8000/api/tasks/$ID/start"
+curl -s "http://localhost:8000/api/tasks/$ID/results"
 ```
+
+**WebSocket messages** all share one envelope:
+
+```jsonc
+{ "task_id": "…", "step": 3, "action": "click",
+  "raw_event": { "description": "…", "params": { "element_id": 10 } },
+  "ui_event":  { "type": "action", "message": "Clicking: …" },
+  "timestamp": "…" }
+```
+
+Inbound, from the live panel: `{"user_action": "click", "x": 720, "y": 430}`, plus
+`take_control`, `give_control_back`, `pause`, `resume`, `approve_action`,
+`reject_action`, `captcha_resume`, `cancel`, `type`, `keypress`, `scroll`.
 
 ---
 
@@ -342,32 +358,13 @@ curl -X POST http://localhost:8000/api/tasks \
 
 | Layer | Technology |
 |---|---|
-| **Frontend** | Next.js 14, React, Tailwind CSS, ShadCN |
+| **Frontend** | Next.js 14, React, Tailwind CSS |
 | **Backend** | Python 3.13, FastAPI, SQLAlchemy (async), Pydantic v2 |
-| **Browser** | Playwright (async headless Chromium) |
-| **LLM** | OpenRouter (GPT-4o-mini via OpenAI-compatible API) |
-| **Memory** | FAISS + `text-embedding-3-small` (optional, graceful fallback) |
-| **Database** | SQLite (local dev) / PostgreSQL (production) |
-| **Task Queue** | Redis + custom worker (auto-bypassed locally) |
-| **Comms** | WebSocket (Redis PubSub or DB polling fallback) |
+| **Browser** | Playwright (async Chromium) + Chrome DevTools Protocol screencast |
+| **LLM** | Any OpenAI-compatible endpoint (OpenRouter, OpenAI) |
+| **Database** | SQLite (local) / PostgreSQL (production) |
+| **Comms** | One WebSocket per task, bidirectional |
 | **Containers** | Docker + Docker Compose |
-
----
-
-## 🐛 Known Issues & Fixes Applied
-
-24 bugs were found and resolved during development. Key fixes:
-
-| # | Issue | Fix Applied |
-|---|---|---|
-| Database | `postgresql.UUID` type crashes SQLite | Switched to `sqlalchemy.Uuid` universally |
-| Agent | HTML extraction overflowed LLM context | Switched to `innerText` for reliable parsing |
-| Agent | Replanning executed old plan, not new one | Fixed agent loop to restart with new plan |
-| WebSocket | `EventSource` caused reconnection loops & quota exhaustion | Replaced with `fetch` + `ReadableStream` |
-| Config | `.env` loaded relative to CWD (picked up wrong file) | Now loads by `Path(__file__).parent.parent / ".env"` |
-| Routing | Docker frontend got 404 on task creation | Fixed `NEXT_PUBLIC_API_URL` proxy routing |
-
-See [DEVELOPER_ONBOARDING.md](DEVELOPER_ONBOARDING.md) for the complete bug history and architectural decisions.
 
 ---
 

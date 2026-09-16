@@ -15,16 +15,9 @@ services:
       timeout: 5s
       retries: 5
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: [ "CMD", "redis-cli", "ping" ]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
+  # The agent runs inside this process. The live browser panel forwards clicks
+  # into the very same Playwright instance the agent is driving, so execution
+  # cannot be split into a separate worker container.
   backend:
     build:
       context: ./backend
@@ -35,35 +28,13 @@ services:
       - ./backend/.env
     environment:
       DATABASE_URL: postgresql://agent_user:agent_pass@postgres:5432/agent_db
-      REDIS_URL: redis://redis:6379/0
+      CORS_ORIGINS: http://localhost:3000
     depends_on:
       postgres:
-        condition: service_healthy
-      redis:
         condition: service_healthy
     volumes:
       - ./backend:/app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-
-  worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    env_file:
-      - ./backend/.env
-    environment:
-      DATABASE_URL: postgresql://agent_user:agent_pass@postgres:5432/agent_db
-      REDIS_URL: redis://redis:6379/0
-      DISPLAY: ${DISPLAY}
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    volumes:
-      - ./backend:/app
-      - /tmp/.X11-unix:/tmp/.X11-unix
-    command: python -m app.workers.task_worker
 
   frontend:
     build:

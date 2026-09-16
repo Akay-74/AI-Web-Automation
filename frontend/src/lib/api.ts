@@ -28,21 +28,33 @@ export interface TaskStep {
     status: string;
     details: any;
     timestamp: string;
-    ui_event?: UiEvent;
-    raw_event?: any;
 }
 
-export interface ProductResult {
-    name: string;
-    price?: number | null;
+export type ControlState =
+    | "AI_ACTIVE"
+    | "AI_PAUSED"
+    | "HUMAN_ACTIVE"
+    | "WAITING_FOR_APPROVAL"
+    | "COMPLETED"
+    | "FAILED";
+
+export interface ApprovalRequest {
+    action: string;
+    description: string;
+    reason: string;
+    riskLevel: string;
+    timeoutSeconds: number;
+}
+
+/** One extracted row. Fields depend on the schema the agent used. */
+export interface ExtractedRow {
+    name?: string;
+    title?: string;
+    price?: number | string | null;
     currency?: string;
     rating?: number | string;
     url?: string;
-    gpu?: string;
-    cpu?: string;
-    ram?: string;
-    storage?: string;
-    validation_reason?: string;
+    specs?: string;
     [key: string]: any;
 }
 

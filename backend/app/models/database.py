@@ -3,10 +3,17 @@
 Supports both PostgreSQL (production) and SQLite (local development).
 """
 
+from datetime import datetime, timezone
+
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 
 from app.config import get_settings
+
+
+def utcnow() -> datetime:
+    """Timezone-aware UTC now, for model column defaults."""
+    return datetime.now(timezone.utc)
 
 settings = get_settings()
 

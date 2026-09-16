@@ -1,223 +1,140 @@
-"""WebSocket endpoint for live task execution updates.
+"""WebSocket endpoint for live task updates and user input.
 
-Dual-mode: subscribes to Redis PubSub when Redis is available,
-otherwise falls back to polling the SQLite task log table so local mode
-works without Redis.
+One transport, both directions:
+  * server → client: agent events and screencast frames, pushed by the running
+    loop through ``manager.broadcast``.
+  * client → server: clicks, keystrokes, and control commands, forwarded to the
+    task's ``BrowserController`` / ``AgentLoop`` via the agent registry.
+
+There is no database polling and no message broker in this path. The agent runs
+in this process, so it hands its events straight to the connection manager.
 """
 
-from uuid import UUID
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-import structlog
 import asyncio
 import json
+from uuid import UUID
 
-from app.config import get_settings
+import structlog
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+from app.services.agent.registry import get_agent, get_browser
 
 logger = structlog.get_logger()
 router = APIRouter()
 
 
 class ConnectionManager:
-    """Manages active WebSocket connections per task."""
+    """Tracks the open sockets watching each task."""
 
     def __init__(self):
         self.active: dict[str, list[WebSocket]] = {}
 
-    async def connect(self, task_id: str, websocket: WebSocket):
+    async def connect(self, task_id: str, websocket: WebSocket) -> None:
         await websocket.accept()
-        if task_id not in self.active:
-            self.active[task_id] = []
-        self.active[task_id].append(websocket)
-        logger.info("WebSocket connected", task_id=task_id)
+        self.active.setdefault(task_id, []).append(websocket)
+        logger.info("WebSocket connected", task_id=task_id, watchers=len(self.active[task_id]))
 
-    def disconnect(self, task_id: str, websocket: WebSocket):
-        if task_id in self.active:
-            try:
-                self.active[task_id].remove(websocket)
-            except ValueError:
-                pass
-            if not self.active[task_id]:
-                del self.active[task_id]
+    def disconnect(self, task_id: str, websocket: WebSocket) -> None:
+        sockets = self.active.get(task_id)
+        if not sockets:
+            return
+        if websocket in sockets:
+            sockets.remove(websocket)
+        if not sockets:
+            del self.active[task_id]
         logger.info("WebSocket disconnected", task_id=task_id)
 
-    async def broadcast(self, task_id: str, message: dict):
-        if task_id in self.active:
-            dead = []
-            for ws in list(self.active[task_id]):
-                try:
-                    await ws.send_json(message)
-                except Exception:
-                    dead.append(ws)
-            for ws in dead:
-                self.disconnect(task_id, ws)
+    async def broadcast(self, task_id: str, message: dict) -> None:
+        """Push one message to every socket watching *task_id*."""
+        sockets = self.active.get(task_id)
+        if not sockets:
+            return
+
+        dead = []
+        for ws in list(sockets):
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(task_id, ws)
 
 
 manager = ConnectionManager()
 
 
-async def _redis_available() -> bool:
-    """Check if Redis is reachable."""
-    try:
-        import redis.asyncio as aioredis
-        settings = get_settings()
-        r = aioredis.from_url(settings.redis_url, socket_connect_timeout=1)
-        await r.ping()
-        await r.close()
-        return True
-    except Exception:
-        return False
+async def _handle_user_message(task_id: str, data: dict) -> None:
+    """Apply one inbound command from the live browser panel."""
+    action = data.get("user_action")
+    if not action:
+        return
 
+    agent = get_agent(task_id)
+    browser = get_browser(task_id)
 
-async def _stream_via_redis(websocket: WebSocket, task_id: str):
-    """Forward task updates from Redis PubSub to the WebSocket."""
-    import redis.asyncio as aioredis
-    settings = get_settings()
-    redis_client = aioredis.from_url(settings.redis_url)
-    pubsub = redis_client.pubsub()
-    await pubsub.subscribe(f"task_updates:{task_id}")
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                data = json.loads(message["data"])
-                await websocket.send_json(data)
-                if data.get("status") in ("completed", "failed", "cancelled"):
-                    break
-    finally:
-        await pubsub.unsubscribe(f"task_updates:{task_id}")
-        await redis_client.close()
+    if agent:
+        if action == "take_control":
+            await agent.control.take_control()
+            return
+        if action in ("give_control_back", "resume_ai", "resume"):
+            await agent.control.give_control_back()
+            return
+        if action == "pause":
+            await agent.control.pause_for_human()
+            return
+        if action == "approve_action":
+            await agent.control.respond_to_approval(True)
+            return
+        if action == "reject_action":
+            await agent.control.respond_to_approval(False)
+            return
+        if action == "cancel":
+            agent.cancel()
+            return
 
+    if not browser:
+        logger.debug("Input for a task with no live browser", task_id=task_id, user_action=action)
+        return
 
-async def _stream_via_polling(websocket: WebSocket, task_id: str):
-    """Poll the database for new task logs and broadcast them to the WebSocket.
-
-    Used as the local/Redis-free fallback. Sends task log entries as they
-    appear, then watches for a terminal status on the task itself.
-    """
-    import uuid as _uuid
-    from sqlalchemy import select
-    from app.models.database import AsyncSessionLocal
-    from app.models.task import Task, TaskLog
-
-    # Coerce str → UUID so SQLAlchemy Uuid columns work
-    task_uuid = _uuid.UUID(task_id) if isinstance(task_id, str) else task_id
-
-    last_log_step = -1
-    poll_interval = 0.5  # seconds
-    timeout_secs = 600   # 10 minutes max
-
-    for _ in range(int(timeout_secs / poll_interval)):
-        try:
-            async with AsyncSessionLocal() as db:
-                # Fetch any new log entries since last seen step
-                logs_result = await db.execute(
-                    select(TaskLog)
-                    .where(TaskLog.task_id == task_uuid)
-                    .where(TaskLog.step_number > last_log_step)
-                    .order_by(TaskLog.step_number)
-                )
-                new_logs = logs_result.scalars().all()
-                for log in new_logs:
-                    await websocket.send_json({
-                        "task_id": task_id,
-                        "step": log.step_number,
-                        "action": log.action,
-                        "raw_event": log.details or {},
-                        "ui_event": {
-                            "type": "info",
-                            "message": log.action,
-                            "step": log.step_number,
-                            "timestamp": log.created_at.isoformat(),
-                        },
-                        "timestamp": log.created_at.isoformat(),
-                    })
-                    last_log_step = max(last_log_step, log.step_number)
-
-                # Check task terminal state
-                task_result = await db.execute(
-                    select(Task).where(Task.id == task_uuid)
-                )
-                task = task_result.scalar_one_or_none()
-                if task and task.status in ("completed", "failed", "cancelled"):
-                    await websocket.send_json({
-                        "task_id": task_id,
-                        "status": task.status,
-                        "action": f"task_{task.status}",
-                    })
-                    break
-        except WebSocketDisconnect:
-            break
-        except Exception as e:
-            logger.warning("WS poll error", error=str(e)[:200])
-            break
-
-        await asyncio.sleep(poll_interval)
+    if action == "click":
+        await browser.handle_user_click(float(data.get("x", 0)), float(data.get("y", 0)))
+    elif action == "type":
+        await browser.handle_user_type(str(data.get("text", "")))
+    elif action == "keypress":
+        await browser.handle_user_keypress(str(data.get("key", "Enter")))
+    elif action == "scroll":
+        await browser.handle_user_scroll(
+            float(data.get("deltaX", 0)),
+            float(data.get("deltaY", 0)),
+        )
+    elif action == "captcha_resume":
+        browser.resume_after_captcha()
+        if agent:
+            await agent.control.give_control_back()
 
 
 @router.websocket("/ws/tasks/{task_id}")
 async def task_websocket(websocket: WebSocket, task_id: UUID):
-    """Bidirectional WebSocket for live task updates AND user input.
-
-    Outbound (server → client): task execution events, screencast frames.
-    Inbound  (client → server): user clicks, keypresses, CAPTCHA resume.
-
-    Uses Redis PubSub when Redis is available; falls back to DB polling
-    for local development without Redis.
-    """
+    """Stream a task's events, and accept user input for its browser."""
     task_id_str = str(task_id)
     await manager.connect(task_id_str, websocket)
 
-    async def _handle_user_input():
-        """Listen for incoming user input messages and forward to browser."""
-        from app.services.agent.registry import get_browser
-        try:
-            while True:
-                raw = await websocket.receive_text()
-                data = json.loads(raw)
-                action = data.get("user_action")
-                if not action:
-                    continue
-
-                browser = get_browser(task_id_str)
-                if not browser:
-                    continue
-
-                if action == "click":
-                    await browser.handle_user_click(
-                        float(data.get("x", 0)),
-                        float(data.get("y", 0)),
-                    )
-                elif action == "type":
-                    await browser.handle_user_type(data.get("text", ""))
-                elif action == "keypress":
-                    await browser.handle_user_keypress(data.get("key", "Enter"))
-                elif action == "scroll":
-                    await browser.handle_user_scroll(
-                        float(data.get("deltaX", 0)),
-                        float(data.get("deltaY", 0)),
-                    )
-                elif action == "captcha_resume":
-                    browser.resume_after_captcha()
-                    logger.info("CAPTCHA resume received from user", task_id=task_id_str)
-        except WebSocketDisconnect:
-            pass
-        except Exception as e:
-            logger.debug("User input handler ended", error=str(e)[:200])
-
     try:
-        # Start user input listener as a background task
-        input_task = asyncio.create_task(_handle_user_input())
-
-        if await _redis_available():
-            logger.info("WS using Redis PubSub", task_id=task_id_str)
-            await _stream_via_redis(websocket, task_id_str)
-        else:
-            logger.info("WS using DB polling fallback", task_id=task_id_str)
-            await _stream_via_polling(websocket, task_id_str)
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            try:
+                await _handle_user_message(task_id_str, data)
+            except Exception as e:
+                logger.warning("User command failed", task_id=task_id_str, error=str(e)[:200])
     except WebSocketDisconnect:
         pass
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.error("WebSocket error", task_id=task_id_str, error=str(e)[:200])
     finally:
-        input_task.cancel()
         manager.disconnect(task_id_str, websocket)
-

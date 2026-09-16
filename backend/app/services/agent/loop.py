@@ -1,377 +1,539 @@
-"""Agent Loop — Central orchestrator for browser automation tasks.
+"""Agent loop — the perceive → decide → act cycle.
 
-Executes plan steps, streams a live CDP screencast, validates results,
-evaluates completion, and broadcasts both raw events and human-friendly
-UI events.
+Each iteration re-reads the page, asks the planner for one action against that
+page, checks it against the safety gate, and runs it. Nothing is planned
+against a page the agent has not looked at, which is what makes element
+targeting hold up on real sites.
+
+Every event it emits goes through ``_emit`` and out to exactly one sink, so the
+UI, the stored task log, and the agent all agree on what happened.
 """
 
-import base64
-import json
-import re
-from datetime import datetime
-from typing import Optional, Callable, Awaitable
+from datetime import datetime, timezone
+from typing import Awaitable, Callable, Optional
 
-import redis.asyncio as aioredis
 import structlog
 
 from app.config import get_settings
+from app.services.agent.control import ControlState, ControlStateMachine
 from app.services.agent.planner import AIPlanner
-from app.services.agent.evaluator import ResultEvaluator
-from app.services.agent.validator import ResultValidator
-from app.services.browser.controller import BrowserController, _detect_captcha, _solve_captcha
-from app.services.browser.analyzer import PageAnalyzer
+from app.services.agent.registry import register_agent, unregister_agent
+from app.services.browser.controller import BrowserController, detect_captcha, solve_captcha
 from app.services.browser.extractor import DataExtractor
-from app.services.memory.vector import VectorMemory
-from app.services.agent.registry import register_browser, unregister_browser
+from app.services.browser.state import BrowserState
+from app.services.perception.page_observer import detect_auto_pause_triggers
+from app.services.safety.permissions import SafetyValidator
 
 logger = structlog.get_logger()
 
-# Human-readable action labels
 _ACTION_LABELS = {
     "navigate": "Opening",
-    "type": "Typing",
     "click": "Clicking",
-    "scroll": "Scrolling the page",
-    "extract": "Extracting data",
-    "evaluate": "Evaluating results",
-    "validate": "Validating results",
+    "type": "Typing into",
+    "hover": "Hovering over",
+    "select": "Selecting in",
+    "keypress": "Pressing key",
+    "scroll": "Scrolling",
+    "back": "Going back",
+    "extract": "Extracting data from",
     "wait": "Waiting",
+    "new_tab": "Opening a new tab",
+    "switch_tab": "Switching tab",
+    "close_tab": "Closing tab",
+    "get_tabs": "Listing tabs",
+    "finish": "Finishing",
 }
+
+_RESULT_ACTIONS = {"extracted", "task_completed"}
+_ERROR_ACTIONS = {"task_failed", "action_failed", "approval_denied"}
+_BROWSER_ACTIONS = {"navigate", "click", "type", "scroll", "select", "hover", "keypress", "back"}
 
 
 class AgentLoop:
-    """Runs a complete browser automation task."""
+    """Runs one browser automation task end to end."""
 
     def __init__(
         self,
         task_id: str,
         goal: str,
-        on_step: Optional[Callable[[dict], Awaitable[None]]] = None,
+        on_event: Optional[Callable[[dict], Awaitable[None]]] = None,
     ):
         self.task_id = task_id
         self.goal = goal
-        self.on_step = on_step
+        self.on_event = on_event
         self.settings = get_settings()
 
         self.planner = AIPlanner()
-        self.evaluator = ResultEvaluator()
-        self.validator = ResultValidator(goal)
-        self.browser = BrowserController()
-        self.analyzer = PageAnalyzer()
         self.extractor = DataExtractor()
-        self.memory = VectorMemory(task_id)
+        self.safety = SafetyValidator()
+        self.control = ControlStateMachine(on_state_change=self._on_control_change)
+        self.browser = BrowserController(
+            user_data_dir=self.settings.browser_user_data_dir,
+            headless=self.settings.browser_headless,
+        )
 
+        self.history: list[dict] = []
         self.results: list[dict] = []
-        self.valid_results: list[dict] = []
 
-    # ------ broadcasting ------
+        self._cancelled = False
+        # A trigger fires once per URL; re-firing on the page the human just
+        # handed back would pause the agent again immediately.
+        self._paused_for: set[str] = set()
+        self._captcha_handled_for: set[str] = set()
 
-    async def _broadcast(self, step_num: int, action: str, details: dict):
-        """Send structured update with both raw_event and ui_event."""
-        description = details.get("description", "")
-        status_text = details.get("status", "")
+    def cancel(self) -> None:
+        """Ask the loop to stop after the current action."""
+        self._cancelled = True
+        self.browser.resume_after_captcha()  # unblock a CAPTCHA wait
+        self.control.release()  # unblock a pause or a pending approval
 
-        # Build human-friendly message
-        label = _ACTION_LABELS.get(action, action.replace("_", " ").title())
-        if action == "navigate" and "url" in details:
-            ui_message = f"{label} {details['url'][:60]}..."
-        elif action == "type" and "text" in details.get("params", {}):
-            ui_message = f'{label} "{details["params"]["text"][:40]}"'
-        elif description:
-            ui_message = f"{label}: {description}"
-        else:
-            ui_message = label
+    # ------------------------------------------------------------------
+    # Event emission
+    # ------------------------------------------------------------------
 
-        # Map to event type
-        if status_text == "failed" or action == "task_failed":
-            evt_type = "error"
-        elif action in ("extract", "extracted", "evaluated", "validated", "task_completed"):
-            evt_type = "result"
-        elif action in ("navigate", "click", "type", "scroll"):
-            evt_type = "action"
-        else:
-            evt_type = "info"
+    async def _emit(self, step: int, action: str, event: dict, ui_message: Optional[str] = None) -> None:
+        """Send one event to the sink the runner supplied."""
+        if not self.on_event:
+            return
 
         message = {
             "task_id": self.task_id,
-            "step": step_num,
+            "step": step,
             "action": action,
-            "raw_event": details,
-            "ui_event": {
-                "type": evt_type,
-                "message": ui_message,
-                "step": step_num,
-                "timestamp": datetime.utcnow().isoformat(),
-            },
-            "timestamp": datetime.utcnow().isoformat(),
+            "raw_event": event,
+            "timestamp": _now(),
         }
-        if self.on_step:
-            await self.on_step(message)
+        if ui_message is not None:
+            message["ui_event"] = {
+                "type": _ui_type(action, event),
+                "message": ui_message,
+                "step": step,
+                "timestamp": message["timestamp"],
+            }
+        await self.on_event(message)
 
-    async def _send_screencast_frame(self, frame_b64: str):
-        """Forward a CDP screencast frame (base64 JPEG) to the frontend."""
+    async def _emit_frame(self, frame_b64: str) -> None:
+        """Forward a screencast frame. Never logged, never given a UI line."""
+        if not self.on_event:
+            return
         try:
-            msg = {
+            await self.on_event({
                 "task_id": self.task_id,
                 "step": 0,
                 "action": "screencast_frame",
-                "details": {"image": frame_b64, "format": "jpeg"},
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-            if self.on_step:
-                await self.on_step(msg)
+                "raw_event": {"image": frame_b64, "format": "jpeg"},
+                "timestamp": _now(),
+            })
         except Exception as e:
-            logger.debug("Screencast frame forward failed", error=str(e)[:200])
+            logger.debug("Frame forward failed", error=str(e)[:200])
 
-    async def _broadcast_screenshot(self, step_num: int):
-        """Fallback: capture a single PNG screenshot if screencast is off."""
-        try:
-            png_bytes = await self.browser.screenshot()
-            b64 = base64.b64encode(png_bytes).decode("ascii")
-            msg = {
-                "task_id": self.task_id,
-                "step": step_num,
-                "action": "screenshot",
-                "details": {"image": b64},
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-            if self.on_step:
-                await self.on_step(msg)
-        except Exception as e:
-            logger.debug("Screenshot capture failed", error=str(e)[:200])
+    async def _on_control_change(self, old_state: ControlState, new_state: ControlState) -> None:
+        await self._emit(
+            0,
+            "control_state_changed",
+            {"previous_state": old_state.value, "current_state": new_state.value},
+            ui_message=f"Control: {new_state.value.replace('_', ' ').lower()}",
+        )
 
-    # ------ main loop ------
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
 
     async def run(self) -> dict:
-        """Execute the full agent workflow."""
+        """Execute the task. Always returns a result dict, never raises."""
         logger.info("Agent loop started", task_id=self.task_id, goal=self.goal[:80])
 
         try:
-            # Phase 1: Create plan
-            plan = await self.planner.create_plan(self.goal)
-            plan_descriptions = [s.get("description", s.get("action")) for s in plan]
-            await self._broadcast(0, "plan_created", {
-                "steps": len(plan),
-                "plan": plan_descriptions,
-            })
-
-            # Phase 2: Launch browser, start screencast, register for input
             await self.browser.launch()
-            register_browser(self.task_id, self.browser)
-            await self.browser.start_screencast(self._send_screencast_frame)
-            await self._broadcast(0, "browser_launched", {
-                "viewport": self.browser.viewport_size,
-            })
+            register_agent(self.task_id, self, self.browser)
+            await self.browser.start_screencast(self._emit_frame)
+            await self._emit(
+                0,
+                "browser_launched",
+                {"viewport": self.browser.viewport_size},
+                ui_message="Browser ready",
+            )
 
-            # Phase 3: Execute steps
-            replan_count = 0
-            max_replans = self.settings.default_replan_attempts
-
-            step_idx = 0
-            while step_idx < len(plan):
-                if step_idx >= self.settings.max_steps_per_task:
-                    logger.warning("Max steps reached", task_id=self.task_id)
-                    break
-
-                i = step_idx
-                step = plan[step_idx]
-
-                action = step.get("action", "unknown")
-                description = step.get("description", action)
-
-                await self._broadcast(i + 1, action, {
-                    "description": description,
-                    "status": "executing",
-                })
-
-                result = await self.browser.execute(step)
-
-                # Check for CAPTCHA after each action
-                captcha_type = await _detect_captcha(self.browser.page)
-                if captcha_type:
-                    # Broadcast CAPTCHA alert to frontend
-                    await self._broadcast(i + 1, "captcha_detected", {
-                        "captcha_type": captcha_type,
-                        "message": f"{captcha_type.upper()} detected — please solve it in the browser viewer",
-                    })
-                    # Try API solver first if key is configured
-                    api_key = getattr(self.settings, "captcha_api_key", "")
-                    if api_key:
-                        solved = await _solve_captcha(self.browser.page, captcha_type, self.settings)
-                        if solved:
-                            await self._broadcast(i + 1, "captcha_solved", {"method": "api"})
-                        else:
-                            # Fall back to human
-                            await self.browser.pause_for_human_captcha()
-                            await self._broadcast(i + 1, "captcha_solved", {"method": "human"})
-                    else:
-                        # No API key — wait for human
-                        await self.browser.pause_for_human_captcha()
-                        await self._broadcast(i + 1, "captcha_solved", {"method": "human"})
-
-                # Screencast handles continuous frames; only take a
-                # fallback screenshot if screencast is not running.
-                if not self.browser._screencast_running and action not in ("evaluate", "wait"):
-                    await self._broadcast_screenshot(i + 1)
-
-                if not result.get("success", False):
-                    error = result.get("error", "Unknown error")
-                    await self._broadcast(i + 1, action, {
-                        "description": description,
-                        "status": "failed",
-                        "error": error,
-                    })
-
-                    if replan_count < max_replans:
-                        context = self.memory.get_context_summary()
-                        plan = await self.planner.replan(self.goal, context, error)
-                        replan_count += 1
-                        await self._broadcast(i + 1, "replanned", {
-                            "reason": error,
-                            "new_steps": len(plan),
-                        })
-                        step_idx = 0  # Restart the loop with new plan
-                        continue
-                    else:
-                        step_idx += 1
-                        continue
-
-                # Analyze page after nav/click/scroll
-                if action in ("navigate", "click", "scroll"):
-                    try:
-                        html = await self.browser.extract_html()
-                        analysis = self.analyzer.analyze(html)
-                        summary = self.analyzer.create_summary(analysis)
-                        await self.memory.store(summary, {
-                            "url": self.browser.page.url,
-                            "step": i + 1,
-                        })
-                    except Exception as e:
-                        logger.warning("Page analysis failed", error=str(e)[:200])
-
-                # Extract
-                if action == "extract":
-                    schema = step.get("params", {}).get("schema", "generic")
-                    content = result.get("content", "")
-                    extracted = await self.extractor.extract(
-                        content, schema, self.browser.page.url
-                    )
-                    self.results.extend(extracted)
-                    await self._broadcast(i + 1, "extracted", {
-                        "items_count": len(extracted),
-                        "total_results": len(self.results),
-                    })
-
-                    # --- Validate extracted items ---
-                    valid, all_validated = self.validator.validate_all(self.results)
-                    self.valid_results = valid
-                    self.results = all_validated  # keep validation reasons
-
-                    await self._broadcast(i + 1, "validated", {
-                        "total_items": len(all_validated),
-                        "valid_items": len(valid),
-                        "constraints": self.validator.constraints,
-                    })
-
-                    # If zero valid, attempt replan with stricter query
-                    if len(valid) == 0 and replan_count < max_replans:
-                        gpu = self.validator.constraints.get("gpu", "")
-                        stricter_goal = f"{self.goal} - only show {gpu} products"
-                        context = self.memory.get_context_summary()
-                        plan = await self.planner.replan(stricter_goal, context,
-                                                         f"0/{len(all_validated)} items matched constraints")
-                        replan_count += 1
-                        self.results.clear()
-                        self.valid_results.clear()
-                        await self._broadcast(i + 1, "replanned", {
-                            "reason": f"No valid items found (0/{len(all_validated)} matched constraints)",
-                            "new_steps": len(plan),
-                        })
-                        step_idx = 0  # Restart loop with new plan
-                        continue
-
-                # Evaluate
-                if action == "evaluate":
-                    items_for_eval = self.valid_results if self.valid_results else self.results
-                    evaluation = await self.evaluator.evaluate(self.goal, items_for_eval)
-                    await self._broadcast(i + 1, "evaluated", evaluation.to_dict())
-
-                    if evaluation.goal_met:
-                        logger.info("Goal met!", task_id=self.task_id,
-                                    confidence=evaluation.confidence)
-                        break
-
-                await self._broadcast(i + 1, action, {
-                    "description": description,
-                    "status": "completed",
-                })
-                
-                step_idx += 1
-
-            # Phase 4: Final result
-            final_items = self.valid_results if self.valid_results else self.results
-            final_result = {
-                "task_id": self.task_id,
-                "goal": self.goal,
-                "status": "completed" if final_items else "failed",
-                "results": final_items,
-                "all_results": self.results,
-                "summary": self._generate_summary(),
-                "steps_executed": min(
-                    len(plan),
-                    self.settings.max_steps_per_task,
-                ),
-            }
-            return final_result
+            outcome = await self._step_until_done()
 
         except Exception as e:
-            logger.error("Agent loop error", error=str(e), task_id=self.task_id)
-            return {
-                "task_id": self.task_id,
-                "goal": self.goal,
-                "status": "failed",
-                "error": str(e),
-                "results": self.results,
-                "summary": f"Failed: {str(e)[:200]}",
-                "steps_executed": 0,
-            }
+            logger.error("Agent loop crashed", task_id=self.task_id, error=str(e))
+            await self.control.mark_failed()
+            return self._result("failed", f"Failed: {str(e)[:200]}", error=str(e))
+
         finally:
-            unregister_browser(self.task_id)
+            unregister_agent(self.task_id)
             await self.browser.close()
 
-    def _generate_summary(self) -> str:
-        """Generate a human-readable summary."""
-        items = self.valid_results if self.valid_results else self.results
-        if not items:
-            return "No results were extracted."
+        return outcome
 
-        count = len(items)
-        total = len(self.results)
+    async def _step_until_done(self) -> dict:
+        """The cycle itself."""
+        max_steps = self.settings.max_steps_per_task
+        consecutive_failures = 0
+        last_signature: Optional[str] = None
+        repeat_count = 0
+        step = 0
 
-        # Price summary
-        float_prices = []
-        for r in items:
+        while step < max_steps:
+            if self._cancelled:
+                return self._result("cancelled", f"Cancelled before step {step + 1}")
+
+            # 1. Respect whoever is driving.
+            if not self.control.can_act():
+                resumed = await self.control.wait_until_active(
+                    self.settings.human_pause_timeout_seconds
+                )
+                if not resumed:
+                    return self._result(
+                        "failed",
+                        "Stopped waiting for a human after "
+                        f"{self.settings.human_pause_timeout_seconds}s "
+                        f"(state: {self.control.state.value})",
+                    )
+                if self._cancelled:
+                    return self._result("cancelled", "Cancelled while paused")
+
+            step += 1
+
+            # 2. Observe.
+            state = await self.browser.get_browser_state()
+            interrupted = await self._handle_interruptions(step, state)
+            if self._cancelled:
+                return self._result("cancelled", "Cancelled during observation")
+            if interrupted or not self.control.can_act():
+                # Whatever happened — a CAPTCHA cleared, the human clicked
+                # around — the page has moved on, so this observation cannot be
+                # used to decide anything. Spend the step and look again.
+                continue
+
+            # 3. Decide.
             try:
-                cleaned = str(r.get("price", "")).replace("$", "").replace(",", "").strip()
-                float_prices.append(float(cleaned))
-            except (ValueError, TypeError):
-                pass
+                decision = await self.planner.decide_next_action(
+                    goal=self.goal,
+                    page_state=state.summary_for_llm(self.settings.max_elements_in_context),
+                    history=self.history,
+                    steps_left=max_steps - step,
+                    extracted_count=len(self.results),
+                )
+            except Exception as e:
+                logger.error("Planner failed", error=str(e)[:300])
+                return self._result("failed", f"Planner failed: {str(e)[:160]}", error=str(e))
 
-        if float_prices:
-            min_price = min(float_prices)
-            cheapest = next(
-                (r for r in items if _safe_price(r.get("price")) == min_price),
-                None,
+            action = decision["action"]
+            params = decision["params"]
+            description = decision["description"]
+
+            await self._emit(
+                step,
+                action,
+                {
+                    "description": description,
+                    "reasoning": decision["reasoning"],
+                    "params": params,
+                    "status": "executing",
+                    "url": state.current_url,
+                },
+                ui_message=_ui_label(action, params, description),
             )
-            name = cheapest.get("name", "Unknown") if cheapest else "Unknown"
-            label = f"Found {count} valid items (out of {total} total). Cheapest: {name} at ₹{min_price:,.2f}"
-            return label
 
-        return f"Found {count} valid results (out of {total} total)."
+            if action == "finish":
+                summary = str(params.get("result") or description)
+                # The planner reports whether it actually got there; a run that
+                # hit a dead end is a failure even though it ended tidily.
+                succeeded = params.get("success", True) is not False
+                if succeeded:
+                    await self.control.mark_completed()
+                else:
+                    await self.control.mark_failed()
+                return self._result("completed" if succeeded else "failed", summary)
+
+            # Re-sending the same action against the same page is not progress.
+            signature = _signature(action, params, state.current_url)
+            repeat_count = repeat_count + 1 if signature == last_signature else 1
+            last_signature = signature
+            if action != "scroll" and repeat_count >= self.settings.max_repeated_actions:
+                await self.control.mark_failed()
+                return self._result(
+                    "failed",
+                    f"Stuck repeating '{action}' on {state.current_url[:80]} "
+                    f"{repeat_count} times with no effect.",
+                )
+
+            # 4. Check the action against the page and the safety gate.
+            element = self.browser.resolve_element(params)
+            if params.get("element_id") is not None and element is None:
+                consecutive_failures += 1
+                await self._record_failure(
+                    step, action, description,
+                    f"element_id {params.get('element_id')} is not on this page",
+                )
+                if consecutive_failures >= self.settings.max_consecutive_failures:
+                    return self._result("failed", "Too many invalid element references in a row")
+                continue
+
+            risk = self.safety.classify(action, params, element, state.current_url)
+            if risk.requires_approval:
+                if not await self._get_approval(step, action, description, risk):
+                    consecutive_failures += 1
+                    if consecutive_failures >= self.settings.max_consecutive_failures:
+                        return self._result("failed", "Too many actions were not approved")
+                    continue
+
+            # 5. Act.
+            result = await self.browser.execute(action, params)
+
+            if not result.get("success"):
+                consecutive_failures += 1
+                await self._record_failure(step, action, description, result.get("error", "unknown error"))
+                if consecutive_failures >= self.settings.max_consecutive_failures:
+                    return self._result(
+                        "failed",
+                        f"{consecutive_failures} actions failed in a row; last error: "
+                        f"{str(result.get('error'))[:120]}",
+                    )
+                continue
+
+            if action == "extract":
+                rows = await self._handle_extraction(step, result.get("content", ""), params)
+                if not rows:
+                    # A successful call that found nothing has not advanced the
+                    # goal; the planner must be told so it tries elsewhere.
+                    consecutive_failures += 1
+                    self.history.append({
+                        "action": action,
+                        "description": description,
+                        "ok": False,
+                        "error": "extract found 0 items on this page — try a different page or schema",
+                    })
+                    if consecutive_failures >= self.settings.max_consecutive_failures:
+                        return self._result(
+                            "failed",
+                            f"Nothing extractable found after {consecutive_failures} attempts.",
+                        )
+                    continue
+
+                consecutive_failures = 0
+                self.history.append({
+                    "action": action,
+                    "description": description,
+                    "ok": True,
+                    "note": f"{len(rows)} item(s) extracted",
+                })
+            else:
+                consecutive_failures = 0
+                self.history.append({
+                    "action": action,
+                    "description": description,
+                    "ok": True,
+                    "note": f"now at {result.get('url')}" if result.get("url") else None,
+                })
+
+            await self._emit(
+                step,
+                action,
+                {"description": description, "status": "completed"},
+                ui_message=None,
+            )
+
+        # Budget exhausted.
+        summary = (
+            f"Reached the {max_steps}-step limit with {len(self.results)} item(s) collected."
+        )
+        status = "completed" if self.results else "failed"
+        await (self.control.mark_completed() if self.results else self.control.mark_failed())
+        return self._result(status, summary)
+
+    # ------------------------------------------------------------------
+    # Step helpers
+    # ------------------------------------------------------------------
+
+    async def _handle_interruptions(self, step: int, state: BrowserState) -> bool:
+        """Deal with a CAPTCHA or a credential prompt before deciding anything.
+
+        Returns True if it intervened, meaning the caller's view of the page is
+        no longer current. Each trigger fires once per URL; re-firing on the
+        page the human just handed back would pause the agent again at once.
+        """
+        url = state.current_url
+
+        captcha_type = await detect_captcha(self.browser.page)
+        if captcha_type and url not in self._captcha_handled_for:
+            self._captcha_handled_for.add(url)
+            await self._solve_or_hand_over(step, captcha_type)
+            return True
+
+        if url in self._paused_for:
+            return False
+
+        trigger = await detect_auto_pause_triggers(self.browser.page)
+        if trigger.should_pause:
+            self._paused_for.add(url)
+            await self.control.pause_for_human()
+            await self._emit(
+                step,
+                "auto_pause_triggered",
+                {
+                    "trigger_type": trigger.trigger_type,
+                    "reason": trigger.reason,
+                    "url": url,
+                },
+                ui_message=f"Paused: {trigger.reason}. Take over in the browser panel, then resume.",
+            )
+            return True
+
+        return False
+
+    async def _solve_or_hand_over(self, step: int, captcha_type: str) -> None:
+        """Try the solver API, else wait for the human to click through it."""
+        await self._emit(
+            step,
+            "captcha_detected",
+            {"captcha_type": captcha_type},
+            ui_message=f"{captcha_type} challenge detected",
+        )
+
+        if self.settings.captcha_api_key:
+            solved = await solve_captcha(
+                self.browser.page, captcha_type, self.settings.captcha_api_key
+            )
+            if solved:
+                await self._emit(
+                    step, "captcha_solved", {"method": "api"},
+                    ui_message="CAPTCHA solved automatically",
+                )
+                return
+
+        await self.control.take_control()
+        solved = await self.browser.pause_for_human_captcha(
+            self.settings.human_pause_timeout_seconds
+        )
+        await self.control.give_control_back()
+        await self._emit(
+            step,
+            "captcha_solved" if solved else "captcha_timeout",
+            {"method": "human", "solved": solved},
+            ui_message="CAPTCHA cleared by you" if solved else "Nobody solved the CAPTCHA in time",
+        )
+
+    async def _get_approval(self, step: int, action: str, description: str, risk) -> bool:
+        """Ask the human before an irreversible action. False = do not run it."""
+        await self._emit(
+            step,
+            "approval_requested",
+            {
+                "action": action,
+                "description": description,
+                **risk.to_dict(),
+                "timeout_seconds": self.settings.approval_timeout_seconds,
+            },
+            ui_message=f"Approval needed: {risk.reason}",
+        )
+
+        approved, timed_out = await self.control.request_approval(
+            {"action": action, "description": description, "reason": risk.reason},
+            timeout=self.settings.approval_timeout_seconds,
+        )
+
+        if approved:
+            await self._emit(
+                step, "approval_granted", {"action": action},
+                ui_message="You approved it — continuing",
+            )
+            return True
+
+        reason = "nobody answered in time" if timed_out else "you declined"
+        await self._record_failure(step, action, description, f"Not approved ({reason})")
+        await self._emit(
+            step, "approval_denied", {"action": action, "timed_out": timed_out},
+            ui_message=f"Skipped — {reason}",
+        )
+        return False
+
+    async def _handle_extraction(self, step: int, content: str, params: dict) -> list[dict]:
+        """Run the extractor over the page text and keep the rows."""
+        schema = str(params.get("schema", "generic"))
+        try:
+            rows = await self.extractor.extract(content, schema, goal=self.goal)
+        except Exception as e:
+            logger.warning("Extraction failed", error=str(e)[:200])
+            await self._record_failure(step, "extract", "Extract data", str(e)[:160])
+            return []
+
+        self.results.extend(rows)
+        await self._emit(
+            step,
+            "extracted",
+            {"items_count": len(rows), "total_results": len(self.results), "schema": schema},
+            ui_message=(
+                f"Extracted {len(rows)} item(s) — {len(self.results)} total"
+                if rows
+                else "Nothing extractable on this page"
+            ),
+        )
+        return rows
+
+    async def _record_failure(self, step: int, action: str, description: str, error: str) -> None:
+        """Log a failed action into history so the planner can route around it."""
+        self.history.append({
+            "action": action,
+            "description": description,
+            "ok": False,
+            "error": error,
+        })
+        await self._emit(
+            step,
+            "action_failed",
+            {"description": description, "status": "failed", "error": error, "of_action": action},
+            ui_message=f"{action} failed: {error[:100]}",
+        )
+
+    def _result(self, status: str, summary: str, error: Optional[str] = None) -> dict:
+        result = {
+            "task_id": self.task_id,
+            "goal": self.goal,
+            "status": status,
+            "results": self.results,
+            "summary": summary,
+            "steps_executed": len(self.history),
+        }
+        if error:
+            result["error"] = error
+        logger.info("Agent loop finished", task_id=self.task_id, status=status, items=len(self.results))
+        return result
 
 
-def _safe_price(price) -> Optional[float]:
-    try:
-        return float(str(price).replace("$", "").replace(",", "").strip())
-    except (ValueError, TypeError):
-        return None
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _signature(action: str, params: dict, url: str) -> str:
+    """Identity of an attempt, for spotting a loop that is going nowhere."""
+    key_params = sorted(
+        (k, str(v)) for k, v in params.items() if k in ("element_id", "url", "text", "key", "tab_id", "schema")
+    )
+    return f"{url}|{action}|{key_params}"
+
+
+def _ui_type(action: str, event: dict) -> str:
+    if action in _ERROR_ACTIONS or event.get("status") == "failed":
+        return "error"
+    if action in _RESULT_ACTIONS:
+        return "result"
+    if action in _BROWSER_ACTIONS:
+        return "action"
+    return "info"
+
+
+def _ui_label(action: str, params: dict, description: str) -> str:
+    """One readable line for the execution feed."""
+    label = _ACTION_LABELS.get(action, action.replace("_", " ").title())
+
+    if action == "navigate" and params.get("url"):
+        return f"{label} {str(params['url'])[:70]}"
+    if action == "type" and params.get("text"):
+        suffix = " and submitting" if params.get("submit") else ""
+        return f'{label} a field: "{str(params["text"])[:50]}"{suffix}'
+    if description:
+        return f"{label}: {description}"
+    return label

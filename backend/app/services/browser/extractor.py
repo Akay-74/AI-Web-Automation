@@ -1,53 +1,28 @@
-"""Data Extractor — Converts page content into structured data.
+"""Data extractor — turns page text into structured rows via the LLM.
 
-Uses CSS selector-based extraction first (zero cost), falls back to
-LLM-based extraction only when needed.
+An earlier version tried a regex "fast path" first, splitting the page on blank
+lines and treating anything containing a currency symbol as a product. It
+short-circuited the real extraction and produced junk rows, so the LLM is now
+the only path.
 """
 
 import json
-import re
-from typing import Optional
-from openai import AsyncOpenAI
+
 import structlog
+from openai import AsyncOpenAI
 
 from app.config import get_settings
 
 logger = structlog.get_logger()
 
-# Known site-specific extraction rules (CSS selectors)
-SITE_RULES = {
-    "amazon.com": {
-        "container": "div[data-component-type='s-search-result']",
-        "fields": {
-            "name": "h2 span.a-text-normal",
-            "price": "span.a-price > span.a-offscreen",
-            "rating": "span.a-icon-alt",
-            "url": "h2 a.a-link-normal::attr(href)",
-        }
-    },
-    "google.com": {
-        "container": "div.g",
-        "fields": {
-            "title": "h3",
-            "url": "a::attr(href)",
-            "snippet": "div.VwiC3b",
-        }
-    },
-}
-
-# Schemas for LLM extraction
 EXTRACTION_SCHEMAS = {
     "product": {
         "name": "Product name",
-        "price": "Price as a numeric value (e.g. 1099.99) - strip currency symbols",
+        "price": "Price as a number (e.g. 1099.99), no currency symbol",
         "currency": "Currency code (e.g. USD, INR)",
         "rating": "Rating out of 5",
-        "url": "Product URL or 'No link'",
-        "gpu": "Graphics card model (e.g. RTX 4060, Integrated)",
-        "cpu": "Processor model",
-        "ram": "RAM amount (e.g. 16GB)",
-        "storage": "Storage amount (e.g. 1TB SSD)",
-        "validation_reason": "Leave empty",
+        "url": "Product URL if present",
+        "specs": "Key specifications as a short string",
     },
     "job": {
         "title": "Job title",
@@ -55,90 +30,79 @@ EXTRACTION_SCHEMAS = {
         "location": "Location",
         "salary_range": "Salary range if available",
         "url": "Job listing URL",
-        "posted_date": "When posted",
+        "posted_date": "When it was posted",
     },
     "article": {
         "title": "Article title",
-        "source": "Publication/website name",
-        "summary": "Brief summary (1-2 sentences)",
+        "source": "Publication or website name",
+        "summary": "Brief summary, 1-2 sentences",
         "url": "Article URL",
         "published_date": "Publication date",
     },
     "generic": {
         "title": "Title or heading",
-        "content": "Main content",
+        "content": "The relevant content",
         "url": "URL if available",
     },
 }
 
+_MAX_ITEMS = 20
+
 
 class DataExtractor:
-    """Extracts structured data from page content."""
+    """Extracts structured rows from page text."""
 
     def __init__(self):
         settings = get_settings()
-        self.client = AsyncOpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
+        self.client = AsyncOpenAI(
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url,
+        )
+        self.model = settings.chat_model
 
-    def _try_deterministic(self, text: str, url: str, schema: str) -> Optional[list[dict]]:
-        """Try to extract data using regex and heuristics (zero cost)."""
-        # Price extraction heuristic
-        if schema == "product":
-            prices = re.findall(r'\$[\d,]+\.?\d*', text)
-            if prices and len(prices) >= 2:
-                # Simple heuristic: extract product-like blocks
-                items = []
-                blocks = text.split('\n\n')
-                for block in blocks[:20]:
-                    price_match = re.search(r'\$([\d,]+\.?\d*)', block)
-                    if price_match and len(block) > 20:
-                        items.append({
-                            "name": block.split('\n')[0][:200],
-                            "price": float(price_match.group(1).replace(',', '')),
-                            "currency": "USD",
-                        })
-                if len(items) >= 2:
-                    return items
-        return None
-
-    async def extract(self, page_content: str, schema: str = "generic",
-                      url: str = "") -> list[dict]:
-        """Extract structured data from page content.
-
-        Tries deterministic extraction first, then LLM.
-        """
-        # Try deterministic extraction
-        det_result = self._try_deterministic(page_content, url, schema)
-        if det_result:
-            logger.info("Deterministic extraction", items=len(det_result))
-            return det_result
-
-        # Fall back to LLM extraction
+    async def extract(self, page_content: str, schema: str = "generic", goal: str = "") -> list[dict]:
+        """Extract rows matching *schema* from *page_content*."""
+        settings = get_settings()
         schema_def = EXTRACTION_SCHEMAS.get(schema, EXTRACTION_SCHEMAS["generic"])
 
-        prompt = f"""Extract structured data from this web page content.
+        prompt = f"""Extract structured data from this web page.
 
-Schema (extract these fields for each item found):
+{f'The user is trying to: {goal}' if goal else ''}
+
+Fields to extract for each item:
 {json.dumps(schema_def, indent=2)}
 
 Page content:
 {page_content[:15000]}
 
 Respond with JSON: {{"items": [{{...}}, ...]}}
-Extract up to 10 items. If no items match, return {{"items": []}}.
+Extract up to {_MAX_ITEMS} items. Omit a field when the page does not state it.
+Return {{"items": []}} if the page holds nothing matching.
 """
 
         response = await self.client.chat.completions.create(
-            model=get_settings().openai_model,
+            model=self.model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=2048,
+            max_tokens=settings.max_tokens_extraction,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
 
-        content = response.choices[0].message.content
-        result = json.loads(content)
-        items = result.get("items", [])
+        try:
+            payload = json.loads(response.choices[0].message.content or "{}")
+        except json.JSONDecodeError:
+            logger.warning("Extraction returned malformed JSON")
+            return []
 
-        logger.info("LLM extraction", items=len(items),
-                     tokens=response.usage.total_tokens)
-        return items
+        items = payload.get("items")
+        if not isinstance(items, list):
+            return []
+
+        rows = [item for item in items[:_MAX_ITEMS] if isinstance(item, dict)]
+        logger.info(
+            "Extracted rows",
+            count=len(rows),
+            schema=schema,
+            tokens=getattr(response.usage, "total_tokens", 0),
+        )
+        return rows
