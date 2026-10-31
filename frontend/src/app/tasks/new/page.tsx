@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { Suspense, useState, useEffect } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
 
@@ -11,7 +11,17 @@ const quickGoals = [
     { label: "Job Scanner", goal: "Find remote Python developer jobs under $150k on Indeed" },
 ];
 
+// useSearchParams() needs a Suspense boundary, or `next build` fails to
+// prerender this page.
 export default function NewTaskPage() {
+    return (
+        <Suspense fallback={null}>
+            <NewTaskForm />
+        </Suspense>
+    );
+}
+
+function NewTaskForm() {
     const router = useRouter();
     const searchParams = useSearchParams();
     const [goal, setGoal] = useState("");
