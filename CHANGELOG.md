@@ -5,6 +5,15 @@ All notable changes to the AI Web Automation Agent project will be documented in
 ## [Unreleased]
 
 ### Added
+- **Optional API key**: set `API_KEY` in `backend/.env` to require `X-API-Key` on `/api/*` and `?api_key=` on the task WebSocket (`backend/app/api/auth.py`). Off by default for local development; the frontend sends `NEXT_PUBLIC_API_KEY`.
+- **CI**: GitHub Actions runs the backend pytest suite and a frontend typecheck plus production build on every push and pull request.
+
+### Removed
+- **Third-party CAPTCHA solving**: the 2Captcha integration and `CAPTCHA_API_KEY` are gone. A detected CAPTCHA now always hands the live browser to the human.
+
+### Fixed
+- `next build` failed to prerender `/tasks/new` because `useSearchParams()` had no Suspense boundary.
+
 - **Validation Layer**: Introduced `backend/app/services/agent/validator.py` to parse constraints (GPU model, brand, price limit) from user goals and deterministically validate extracted items, appending a `validation_reason` string.
 - **Backend Task Execution Fallback**: Added `_run_agent_background` in `backend/app/api/routes/tasks.py` that bypasses Redis and runs the `AgentLoop` as a FastAPI background task if Redis is unreachable (ideal for local SQLite dev).
 - **Frontend UI Redesign**: 

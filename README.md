@@ -6,6 +6,7 @@
 
 Type a natural-language goal and an autonomous agent drives a real browser to carry it out — looking at each page, deciding the next action, and returning structured results while you watch it live.
 
+[![CI](https://github.com/Akay-74/AI-Web-Automation/actions/workflows/ci.yml/badge.svg)](https://github.com/Akay-74/AI-Web-Automation/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.13-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.135-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Next.js](https://img.shields.io/badge/Next.js-14-000000?style=flat-square&logo=nextdotjs&logoColor=white)](https://nextjs.org)
@@ -213,7 +214,8 @@ cat > .env << EOF
 OPENAI_API_KEY=sk-or-v1-your-openrouter-key-here
 OPENAI_BASE_URL=https://openrouter.ai/api/v1
 DATABASE_URL=sqlite:///./agent.db
-# Optional: CAPTCHA_API_KEY=your-2captcha-key
+# Optional: require a shared secret on every API/WebSocket call
+# API_KEY=pick-a-long-random-string
 EOF
 
 uvicorn app.main:app --reload --port 8000
@@ -244,6 +246,7 @@ All optional, all via `backend/.env`:
 | `VIEWPORT_WIDTH` / `VIEWPORT_HEIGHT` | `1440` / `900` | Browser size; the screencast matches it 1:1 |
 | `SCREENCAST_FPS` / `SCREENCAST_QUALITY` | `8` / `55` | Raise for a smoother stream, at more bandwidth |
 | `MAX_STEPS_PER_TASK` | `25` | Step budget per task |
+| `API_KEY` | — | Require `X-API-Key` on `/api/*` and `?api_key=` on the WebSocket. Set the same value as `NEXT_PUBLIC_API_KEY` in `frontend/.env.local` |
 
 ---
 
@@ -268,10 +271,11 @@ source venv/bin/activate
 pytest
 ```
 
-87 tests, no network and no browser, about a second:
+102 tests, no network and no browser, a couple of seconds. The same suite runs in GitHub Actions on every push, alongside a frontend typecheck and production build:
 
 ```
 tests/test_agent_loop.py       # the cycle: re-observation, stall + failure guards, approval, cancel
+tests/test_auth.py             # optional API key on HTTP routes and the WebSocket
 tests/test_browser_state.py    # the page summary the planner reads; config/model-id handling
 tests/test_control.py          # AI ↔ human handover; every wait is bounded
 tests/test_planner.py          # surviving malformed or oddly-shaped model JSON
@@ -288,6 +292,7 @@ tests/test_safety.py           # ordinary clicks pass, irreversible ones are gat
 │   ├── app/
 │   │   ├── main.py                 # FastAPI app, CORS, DB init
 │   │   ├── config.py               # Pydantic Settings (loads .env by absolute path)
+│   │   ├── api/auth.py             # Optional shared-secret API key
 │   │   ├── api/routes/
 │   │   │   ├── tasks.py            # Task CRUD + /start + /cancel + /logs
 │   │   │   ├── results.py          # Results endpoints
@@ -299,13 +304,14 @@ tests/test_safety.py           # ordinary clicks pass, irreversible ones are gat
 │   │       ├── browser/            # controller.py, state.py, extractor.py
 │   │       ├── perception/         # element_mapper.py, page_observer.py
 │   │       └── safety/             # permissions.py
-│   └── tests/                      # 87 offline unit tests
+│   └── tests/                      # 102 offline unit tests
 ├── frontend/
 │   └── src/
 │       ├── app/                    # Next.js App Router pages
 │       ├── components/             # LiveBrowserPanel, ExecutionFeed, ResultCard, Sidebar
 │       ├── hooks/                  # useTaskWebSocket.ts
 │       └── lib/                    # api.ts (typed API client)
+├── .github/workflows/ci.yml        # pytest + frontend typecheck/build
 ├── docker-compose.yml
 └── DEVELOPER_ONBOARDING.md
 ```
@@ -325,7 +331,9 @@ tests/test_safety.py           # ordinary clicks pass, irreversible ones are gat
 | `GET` | `/api/tasks/{id}/results` | Extracted rows |
 | `DELETE` | `/api/tasks/{id}` | Delete a task with its logs and results |
 | `WS` | `/ws/tasks/{id}` | Live events out; clicks and control commands in |
-| `GET` | `/health` | Liveness, and whether an LLM key is configured |
+| `GET` | `/health` | Liveness, whether an LLM key is configured, and whether auth is on |
+
+**Auth:** off by default. With `API_KEY` set, every `/api/*` call needs an `X-API-Key` header and the WebSocket needs `?api_key=…` (browsers cannot set headers on a socket handshake); otherwise HTTP returns `401` and the socket closes with `1008`. `/health` stays public.
 
 **Create and run a task:**
 
@@ -351,6 +359,17 @@ curl -s "http://localhost:8000/api/tasks/$ID/results"
 Inbound, from the live panel: `{"user_action": "click", "x": 720, "y": 430}`, plus
 `take_control`, `give_control_back`, `pause`, `resume`, `approve_action`,
 `reject_action`, `captcha_resume`, `cancel`, `type`, `keypress`, `scroll`.
+
+---
+
+## ⚠️ Known Limitations
+
+Honest scope notes — this is a single-user tool, not a hosted service.
+
+- **Auth is a shared secret, not user accounts.** `NEXT_PUBLIC_API_KEY` ships in the frontend bundle, so it keeps strangers off a personal deployment; it does not separate users. Real multi-tenant use would need per-user auth and per-user task ownership.
+- **CAPTCHAs go to a human.** The agent detects a challenge and hands the live browser to you; it never tries to solve or bypass one.
+- **One process runs the agents.** Tasks run in the API process, so concurrent tasks share its CPU and memory; there is no job queue or horizontal scaling yet.
+- **The safety gate is pattern-based.** It matches the resolved element's accessible name against known high-risk phrases. It is deliberately narrow, so an unusually worded "buy" button can slip past it — keep `BROWSER_USER_DATA_DIR` away from profiles logged in to anything you can't afford to lose.
 
 ---
 
