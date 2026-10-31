@@ -532,7 +532,7 @@ async def test_a_handover_forces_a_fresh_observation(monkeypatch):
         monkeypatch,
         decisions=[decision("finish", {"result": "done after the handover"})],
         # No solver key, so it hands straight over to the human.
-        settings_overrides={"human_pause_timeout_seconds": 0.1, "captcha_api_key": ""},
+        settings_overrides={"human_pause_timeout_seconds": 0.1},
     )
 
     result = await agent.run()

@@ -18,7 +18,7 @@ from app.config import get_settings
 from app.services.agent.control import ControlState, ControlStateMachine
 from app.services.agent.planner import AIPlanner
 from app.services.agent.registry import register_agent, unregister_agent
-from app.services.browser.controller import BrowserController, detect_captcha, solve_captcha
+from app.services.browser.controller import BrowserController, detect_captcha
 from app.services.browser.extractor import DataExtractor
 from app.services.browser.state import BrowserState
 from app.services.perception.page_observer import detect_auto_pause_triggers
@@ -360,7 +360,7 @@ class AgentLoop:
         captcha_type = await detect_captcha(self.browser.page)
         if captcha_type and url not in self._captcha_handled_for:
             self._captcha_handled_for.add(url)
-            await self._solve_or_hand_over(step, captcha_type)
+            await self._hand_over_captcha(step, captcha_type)
             return True
 
         if url in self._paused_for:
@@ -384,25 +384,14 @@ class AgentLoop:
 
         return False
 
-    async def _solve_or_hand_over(self, step: int, captcha_type: str) -> None:
-        """Try the solver API, else wait for the human to click through it."""
+    async def _hand_over_captcha(self, step: int, captcha_type: str) -> None:
+        """Pause and let the human clear the challenge; the agent never solves it."""
         await self._emit(
             step,
             "captcha_detected",
             {"captcha_type": captcha_type},
             ui_message=f"{captcha_type} challenge detected",
         )
-
-        if self.settings.captcha_api_key:
-            solved = await solve_captcha(
-                self.browser.page, captcha_type, self.settings.captcha_api_key
-            )
-            if solved:
-                await self._emit(
-                    step, "captcha_solved", {"method": "api"},
-                    ui_message="CAPTCHA solved automatically",
-                )
-                return
 
         await self.control.take_control()
         solved = await self.browser.pause_for_human_captcha(

@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     app_name: str = "AI Web Automation Agent"
     debug: bool = False
     secret_key: str = "change-me-in-production"
+    # Shared secret for the API and WebSocket. Blank disables the check (local dev).
+    api_key: str = ""
     cors_origins: str = "http://localhost:3000"
 
     # Database
@@ -48,9 +50,6 @@ class Settings(BaseSettings):
     # CDP screencast (streamed to the browser panel over the WebSocket)
     screencast_fps: int = 8
     screencast_quality: int = 55
-
-    # CAPTCHA solver (optional — leave blank to fall back to a human)
-    captcha_api_key: str = ""
 
     model_config = SettingsConfigDict(
         env_file=str(_ENV_FILE),

@@ -1,5 +1,5 @@
 """Browser controller — Playwright wrapper with a CDP screencast, light
-anti-detection, multi-tab handling, and CAPTCHA support.
+anti-detection, multi-tab handling, and CAPTCHA detection.
 
 Actions arrive as ``{"action": ..., "params": {...}}`` and target elements by
 the ``element_id`` the perception layer assigned, which this class resolves to
@@ -41,7 +41,7 @@ _STEALTH_INIT_SCRIPT = """
 
 
 # ---------------------------------------------------------------------------
-# CAPTCHA detection & solving
+# CAPTCHA detection (solving is left to the human)
 # ---------------------------------------------------------------------------
 
 _CAPTCHA_DOM_JS = """() => {
@@ -89,107 +89,6 @@ async def detect_captcha(page: Optional[Page]) -> Optional[str]:
         # A detection failure must not kill the step that triggered it.
         logger.debug("CAPTCHA detection failed", error=str(e)[:200])
         return None
-
-
-# Token injection per provider. The token is passed as an argument rather than
-# interpolated into the source, so a hostile solver response cannot inject JS.
-_INJECT_TOKEN_JS = {
-    "recaptcha": """(token) => {
-        const field = document.getElementById('g-recaptcha-response');
-        if (field) field.innerHTML = token;
-        if (typeof ___grecaptcha_cfg !== 'undefined') {
-            Object.values(___grecaptcha_cfg.clients || {}).forEach((client) => {
-                const cb = client?.S?.S?.callback || client?.S?.callback;
-                if (typeof cb === 'function') cb(token);
-            });
-        }
-    }""",
-    "hcaptcha": """(token) => {
-        document.querySelectorAll('[name="h-captcha-response"]').forEach((el) => {
-            el.innerHTML = token;
-            el.value = token;
-        });
-    }""",
-    "turnstile": """(token) => {
-        document.querySelectorAll('[name="cf-turnstile-response"]').forEach((el) => {
-            el.value = token;
-        });
-        if (window._cf_chl_opt && typeof window._cf_chl_opt.callback === 'function') {
-            window._cf_chl_opt.callback(token);
-        }
-    }""",
-}
-
-_SOLVER_METHODS = {
-    "recaptcha": {"method": "userrecaptcha", "key_param": "googlekey"},
-    "hcaptcha": {"method": "hcaptcha", "key_param": "sitekey"},
-    "turnstile": {"method": "turnstile", "key_param": "sitekey"},
-}
-
-_SITEKEY_JS = """() => {
-    const el = document.querySelector('[data-sitekey], [data-hcaptcha-sitekey]');
-    if (!el) return null;
-    return el.getAttribute('data-sitekey') || el.getAttribute('data-hcaptcha-sitekey');
-}"""
-
-
-async def solve_captcha(page: Page, captcha_type: str, api_key: str) -> bool:
-    """Solve a CAPTCHA through the 2Captcha API. Returns True on success."""
-    solver = _SOLVER_METHODS.get(captcha_type)
-    if not solver:
-        logger.warning("No solver for CAPTCHA type", captcha_type=captcha_type)
-        return False
-
-    try:
-        import httpx
-
-        sitekey = await page.evaluate(_SITEKEY_JS)
-        if not sitekey:
-            logger.warning("CAPTCHA sitekey not found in DOM", captcha_type=captcha_type)
-            return False
-
-        async with httpx.AsyncClient(timeout=30) as client:
-            submit = await client.get(
-                "https://2captcha.com/in.php",
-                params={
-                    "key": api_key,
-                    "method": solver["method"],
-                    solver["key_param"]: sitekey,
-                    "pageurl": page.url,
-                    "json": 1,
-                },
-            )
-            submit_data = submit.json()
-            if submit_data.get("status") != 1:
-                logger.error("CAPTCHA submit rejected", response=submit_data)
-                return False
-
-            captcha_id = submit_data["request"]
-            logger.info("CAPTCHA sent to solver", captcha_id=captcha_id, captcha_type=captcha_type)
-
-            for _ in range(24):  # up to ~120s
-                await asyncio.sleep(5)
-                poll = await client.get(
-                    "https://2captcha.com/res.php",
-                    params={"key": api_key, "action": "get", "id": captcha_id, "json": 1},
-                )
-                poll_data = poll.json()
-
-                if poll_data.get("status") == 1:
-                    await page.evaluate(_INJECT_TOKEN_JS[captcha_type], poll_data["request"])
-                    logger.info("CAPTCHA solved and injected", captcha_type=captcha_type)
-                    return True
-
-                if "CAPCHA_NOT_READY" not in str(poll_data.get("request", "")):
-                    logger.error("CAPTCHA solve failed", response=poll_data)
-                    return False
-
-        logger.warning("CAPTCHA solve timed out", captcha_type=captcha_type)
-        return False
-
-    except Exception as e:
-        logger.error("CAPTCHA solver error", error=str(e)[:300], captcha_type=captcha_type)
-        return False
 
 
 # ---------------------------------------------------------------------------
