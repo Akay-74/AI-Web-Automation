@@ -3,9 +3,10 @@
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.auth import require_api_key
 from app.api.routes import results, tasks, websocket
 from app.config import get_settings
 from app.models.database import Base, engine
@@ -44,8 +45,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(tasks.router, prefix="/api")
-app.include_router(results.router, prefix="/api")
+protected = [Depends(require_api_key)]
+app.include_router(tasks.router, prefix="/api", dependencies=protected)
+app.include_router(results.router, prefix="/api", dependencies=protected)
 app.include_router(websocket.router)
 
 
@@ -55,4 +57,5 @@ async def health_check():
         "status": "healthy",
         "service": "ai-web-automation-agent",
         "llm_configured": bool(settings.openai_api_key),
+        "auth_required": bool(settings.api_key),
     }

@@ -3,6 +3,19 @@
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
 export const WS_BASE_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000";
 
+/**
+ * Must match the backend's API_KEY when that is set. NEXT_PUBLIC_ values ship in
+ * the client bundle, so this gates a personal deployment against strangers; it
+ * is not per-user auth.
+ */
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
+
+function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
+    const headers = new Headers(init.headers);
+    if (API_KEY) headers.set("X-API-Key", API_KEY);
+    return fetch(`${API_BASE_URL}${path}`, { ...init, headers });
+}
+
 export interface Task {
     id: string;
     goal: string;
@@ -60,7 +73,7 @@ export interface ExtractedRow {
 
 export const api = {
     async createTask(goal: string, priority: number = 0): Promise<Task> {
-        const res = await fetch(`${API_BASE_URL}/tasks`, {
+        const res = await apiFetch(`/tasks`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ goal, priority }),
@@ -70,7 +83,7 @@ export const api = {
     },
 
     async startTask(taskId: string): Promise<Task> {
-        const res = await fetch(`${API_BASE_URL}/tasks/${taskId}/start`, {
+        const res = await apiFetch(`/tasks/${taskId}/start`, {
             method: "POST",
         });
         if (!res.ok) throw new Error(await res.text());
@@ -78,13 +91,13 @@ export const api = {
     },
 
     async getTask(taskId: string): Promise<Task> {
-        const res = await fetch(`${API_BASE_URL}/tasks/${taskId}`);
+        const res = await apiFetch(`/tasks/${taskId}`);
         if (!res.ok) throw new Error(await res.text());
         return res.json();
     },
 
     async getTaskLogs(taskId: string): Promise<any[]> {
-        const res = await fetch(`${API_BASE_URL}/tasks/${taskId}/logs`);
+        const res = await apiFetch(`/tasks/${taskId}/logs`);
         if (!res.ok) throw new Error(await res.text());
         return res.json();
     },
@@ -98,13 +111,13 @@ export const api = {
         if (status) params.set("status", status);
         params.set("limit", String(limit));
         params.set("offset", String(offset));
-        const res = await fetch(`${API_BASE_URL}/tasks?${params}`);
+        const res = await apiFetch(`/tasks?${params}`);
         if (!res.ok) throw new Error(await res.text());
         return res.json();
     },
 
     async getTaskResults(taskId: string): Promise<any[]> {
-        const res = await fetch(`${API_BASE_URL}/tasks/${taskId}/results`);
+        const res = await apiFetch(`/tasks/${taskId}/results`);
         if (!res.ok) throw new Error(await res.text());
         const data = await res.json();
         // Backend returns { results: [...] }
@@ -112,13 +125,13 @@ export const api = {
     },
 
     async cancelTask(taskId: string): Promise<Task> {
-        const res = await fetch(`${API_BASE_URL}/tasks/${taskId}/cancel`, { method: "POST" });
+        const res = await apiFetch(`/tasks/${taskId}/cancel`, { method: "POST" });
         if (!res.ok) throw new Error(await res.text());
         return res.json();
     },
 
     async deleteTask(taskId: string): Promise<void> {
-        const res = await fetch(`${API_BASE_URL}/tasks/${taskId}`, { method: "DELETE" });
+        const res = await apiFetch(`/tasks/${taskId}`, { method: "DELETE" });
         if (!res.ok) throw new Error(await res.text());
     },
 };
@@ -131,9 +144,14 @@ export function getWebSocketUrl(taskId: string): string {
             ? new URL(process.env.NEXT_PUBLIC_WS_URL).host
             : window.location.host.replace("3000", "8000"); // fallback local mapping
 
-        return `${protocol}//${host}/ws/tasks/${taskId}`;
+        return `${protocol}//${host}/ws/tasks/${taskId}${wsAuthQuery()}`;
     }
 
     // SSR fallback
-    return `${WS_BASE_URL}/ws/tasks/${taskId}`;
+    return `${WS_BASE_URL}/ws/tasks/${taskId}${wsAuthQuery()}`;
+}
+
+/** Browsers cannot set headers on a WebSocket handshake, so the key rides in the query. */
+function wsAuthQuery(): string {
+    return API_KEY ? `?api_key=${encodeURIComponent(API_KEY)}` : "";
 }

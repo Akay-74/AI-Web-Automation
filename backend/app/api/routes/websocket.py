@@ -17,6 +17,7 @@ from uuid import UUID
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from app.api.auth import websocket_authorized
 from app.services.agent.registry import get_agent, get_browser
 
 logger = structlog.get_logger()
@@ -116,6 +117,11 @@ async def _handle_user_message(task_id: str, data: dict) -> None:
 @router.websocket("/ws/tasks/{task_id}")
 async def task_websocket(websocket: WebSocket, task_id: UUID):
     """Stream a task's events, and accept user input for its browser."""
+    if not websocket_authorized(websocket):
+        # 1008 = policy violation; closing before accept rejects the handshake.
+        await websocket.close(code=1008)
+        return
+
     task_id_str = str(task_id)
     await manager.connect(task_id_str, websocket)
 
